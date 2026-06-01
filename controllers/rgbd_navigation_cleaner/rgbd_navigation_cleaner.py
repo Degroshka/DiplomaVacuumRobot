@@ -35,6 +35,7 @@ from safety import bumper_event_from_raw
 from recovery import decide_side_release_after_backup
 from control_arbiter import ControlOwner, OwnershipLock
 from wall_follow_controller import WallFollowConfig, WallFollowInput, compute_wall_follow_command
+from async_debug_viewer import AsyncDebugViewerClient
 
 try:
     import cv2
@@ -58,13 +59,17 @@ SAVE_EVERY_N_STEPS = 8
 PERFORMANCE_MODE = True
 SHOW_RGB_DEBUG_WINDOW = False  # heavy; enable manually only for short RGB-D debugging sessions
 SHOW_OCCUPANCY_MAP_WINDOW = False   # can be enabled for defense/debug, but it is expensive
+# Step120: move OpenCV GUI event handling to a separate subprocess.  The main
+# Webots controller still renders snapshots when due, but cv2.imshow/waitKey and
+# window interaction no longer block the real-time motor/safety loop.
+ASYNC_DEBUG_VIEWER_ENABLED = True
 # SHOW_COVERAGE_PLANNER_WINDOW is defined later near planner settings.
 DEPTH_MAP_UPDATE_STEPS = 2          # weak depth/free-space map update, not collision avoidance
 CV_MAP_UPDATE_STEPS = 2             # RGB-D feature fusion update cadence
 UNDER_SURFACE_UPDATE_STEPS = 3      # under-furniture objective layer cadence
 ORB_DEBUG_ENABLED = False           # ORB is diagnostic only; not used by navigation
 ORB_DEBUG_UPDATE_STEPS = 8
-WINDOW_UPDATE_STEPS = 10             # render OpenCV windows every N simulator ticks
+WINDOW_UPDATE_STEPS = 30             # Step121: render OpenCV windows rarely; map rendering stayed in main and was a large CPU cost
 DEBUG_PRINT_INTERVAL_SEC = 18.0
 DEBUG_VERBOSE_CONSOLE = False  # Step66/69: keep Webots console readable; HUD still has detailed state.
 
@@ -80,13 +85,30 @@ UNDER_ROUTE_COMMIT_UPDATE_STEPS = 7
 STRUCTURAL_ROUTE_COMMIT_UPDATE_STEPS = 4
 PLANNER_ROUTE_COMMIT_UPDATE_STEPS = 260
 PLANNER_POST_ABORT_FORCE_SEC = 1.40
-WINDOW_ROUTE_COMMIT_UPDATE_STEPS = 20
+WINDOW_ROUTE_COMMIT_UPDATE_STEPS = 60
 OBJECTIVE_NOISE_FILTER_CACHE_ENABLED = True
 OBJECTIVE_NOISE_FILTER_UPDATE_STEPS = 70
 FOOTPRINT_MAP_CACHE_ENABLED = True
 FOOTPRINT_MAP_CACHE_STEPS = 45
 FOOTPRINT_VALUE_CACHE_ENABLED = True
 FOOTPRINT_VALUE_CACHE_STEPS = 45
+
+# Step121: practical performance fix.  The Webots controller must remain the
+# only owner of sensors and motors, so we do not split wheel control across
+# processes.  Instead, heavy advisory layers are throttled harder: planner,
+# map rendering and non-safety map fusion are sampled by cadence/pose changes.
+# Collision safety still uses the fresh RangeFinder/depth frame every step.
+ADAPTIVE_LOAD_SHEDDING_ENABLED = True
+ADAPTIVE_LOAD_SHEDDING_LOOP_MS = 48.0
+ADAPTIVE_LOAD_SHEDDING_EMA_MS = 42.0
+ADAPTIVE_LOAD_SHEDDING_PLANNER_MULT = 2
+ADAPTIVE_LOAD_SHEDDING_MAPPING_MULT = 2
+ADAPTIVE_LOAD_SHEDDING_WINDOW_MULT = 2
+FRONTIER_DIRECT_MAPPING_MIN_REPLAN_STEPS_WHEN_STOPPED = 520
+FRONTIER_DIRECT_MAPPING_STOPPED_MOVE_EPS_M = 0.10
+FAST_DEBUG_RENDER_ENABLED = True
+FAST_DEBUG_RENDER_MIN_STEPS = 45
+FAST_DEBUG_RENDER_ROUTE_STEPS = 80
 
 # the planner must prefer expanding unknown/frontier space over backtracking to
 # old residual uncleaned cells.  Dijkstra/A* style routing is still used, but the
@@ -203,7 +225,29 @@ EXPLORATION_FRONTIER_SINGLE_POINT_COMMIT_ENABLED = True
 EXPLORATION_FRONTIER_SINGLE_POINT_MAX_COST_M = 0.90
 EXPLORATION_FRONTIER_SINGLE_POINT_MAX_STRAIGHT_M = 0.95
 EXPLORATION_FRONTIER_SINGLE_POINT_MAX_TURN_FRAC = 0.58
-EXPLORATION_FRONTIER_ONLY_SNAPSHOT_COOLDOWN_SEC = 4.8
+
+# Step118: do not let a non-committed frontier candidate freeze early mapping.
+# The robot keeps deterministic straight/perimeter motion and samples global
+# frontier candidates only periodically until a route is actually committable.
+FRONTIER_DIRECT_MAPPING_ENABLED = True
+FRONTIER_DIRECT_MAPPING_MAX_COVERAGE_PERCENT = 46.0
+FRONTIER_DIRECT_MAPPING_MIN_FRONT_CLEAR_M = 0.42
+FRONTIER_DIRECT_MAPPING_MIN_CENTER_CLEAR_M = 0.34
+FRONTIER_DIRECT_MAPPING_MIN_BODY_CLEAR_M = 0.070
+FRONTIER_DIRECT_MAPPING_PLANNER_STEPS = 420
+FRONTIER_DIRECT_MAPPING_FORCE_REPLAN_DIST_M = 1.05
+FRONTIER_DIRECT_MAPPING_HOLD_IF_ROUTE_OK = True
+# If frontier-direct is active but the local depth corridor is no longer safe,
+# do not sit with owner=NONE forever.  Treat this as a controlled no-contact
+# row-end: blacklist the current unsafe viewpoint and run the compact recovery
+# sequence (short backup -> cardinal turn -> verify forward).
+FRONTIER_DIRECT_UNSAFE_RECOVERY_ENABLED = True
+FRONTIER_DIRECT_UNSAFE_RECOVERY_FRONT_M = 0.32
+FRONTIER_DIRECT_UNSAFE_RECOVERY_BODY_M = 0.070
+FRONTIER_DIRECT_UNSAFE_RECOVERY_COOLDOWN_SEC = 5.0
+FRONTIER_DIRECT_UNSAFE_BLACKLIST_RADIUS_M = 0.86
+
+EXPLORATION_FRONTIER_ONLY_SNAPSHOT_COOLDOWN_SEC = 9.5
 EXPLORATION_FRONTIER_ONLY_SNAPSHOT_MIN_FRONT_CLEAR_M = 0.30
 EXPLORATION_FRONTIER_ONLY_SNAPSHOT_MIN_BODY_CLEAR_M = 0.070
 # frontier.  If a candidate repeatedly leaves the robot stopped at the same pose,
@@ -2894,6 +2938,8 @@ furniture_zone_cache_step = -999999
 last_perf_debug = "perf startup"
 last_perf_loop_ms = 0.0
 last_planner_update_step = -999999
+last_planner_update_x = 0.0
+last_planner_update_y = 0.0
 last_planner_update_reason = "startup"
 perf_ema_ms = {}
 perf_last_ms = {}
@@ -2929,6 +2975,8 @@ frontier_only_stall_theta = 0.0
 frontier_only_stall_blacklists = 0
 frontier_only_last_blacklist_time = -999.0
 frontier_only_last_stall_debug = "stall=idle"
+frontier_direct_last_unsafe_recovery_at = -999.0
+frontier_direct_last_unsafe_recovery_debug = "unsafeRecovery=idle"
 post_turn_rgbd_snapshot_until = -999.0
 post_turn_rgbd_snapshot_started_at = -999.0
 post_turn_rgbd_snapshot_frames = 0
@@ -3048,6 +3096,10 @@ control_lock = OwnershipLock()
 last_control_owner_debug = "NONE"
 last_owner_source_debug = "ownerSource=none"
 last_optional_block_reason = "startup"
+debug_viewer_client = None
+last_debug_viewer_status = "viewer=init"
+last_load_shedding_debug = "load=normal"
+last_render_throttle_debug = "render=init"
 
 # ORB is only diagnostic, not the main mapping source.
 orb = cv2.ORB_create(nfeatures=350)
@@ -3061,7 +3113,7 @@ print("RangeFinder is used as a depth channel/safety corridor, not as a lidar-st
 print("Camera/RangeFinder in WBT: translation 0.215 0 0.06, rotation 0 -1 0 -5.31e-06; RangeFinder is the RGB-D depth channel, not a lidar")
 print(f"Camera: {CAM_W}x{CAM_H}; RangeFinder: {RF_W}x{RF_H}; FOV={RF_FOV:.2f} rad")
 print("OpenCV keys: S save map, R reset map, K toggle known-map eval, +/- map zoom, C auto/full map, 0 reset view, Q/Esc hide windows")
-print(f"Performance mode={PERFORMANCE_MODE}: depthMap/{DEPTH_MAP_UPDATE_STEPS}->{DEPTH_ROUTE_COMMIT_MAP_UPDATE_STEPS}, CV/{CV_MAP_UPDATE_STEPS}->{CV_ROUTE_COMMIT_MAP_UPDATE_STEPS}, underSurface/{UNDER_SURFACE_UPDATE_STEPS}->{UNDER_ROUTE_COMMIT_UPDATE_STEPS}, planner/{PLANNER_UPDATE_STEPS}->{PLANNER_ROUTE_COMMIT_UPDATE_STEPS}, windows/{WINDOW_UPDATE_STEPS}->{WINDOW_ROUTE_COMMIT_UPDATE_STEPS}, ORB={'on' if ORB_DEBUG_ENABLED else 'off'}, occupancyWindow={'on' if SHOW_OCCUPANCY_MAP_WINDOW else 'off'}")
+print(f"Performance mode={PERFORMANCE_MODE}: depthMap/{DEPTH_MAP_UPDATE_STEPS}->{DEPTH_ROUTE_COMMIT_MAP_UPDATE_STEPS}, CV/{CV_MAP_UPDATE_STEPS}->{CV_ROUTE_COMMIT_MAP_UPDATE_STEPS}, underSurface/{UNDER_SURFACE_UPDATE_STEPS}->{UNDER_ROUTE_COMMIT_UPDATE_STEPS}, planner/{PLANNER_UPDATE_STEPS}->{PLANNER_ROUTE_COMMIT_UPDATE_STEPS}, windows/{WINDOW_UPDATE_STEPS}->{WINDOW_ROUTE_COMMIT_UPDATE_STEPS}, ORB={'on' if ORB_DEBUG_ENABLED else 'off'}, occupancyWindow={'on' if SHOW_OCCUPANCY_MAP_WINDOW else 'off'}, asyncViewer={'on' if ASYNC_DEBUG_VIEWER_ENABLED else 'off'}, loadShed={'on' if ADAPTIVE_LOAD_SHEDDING_ENABLED else 'off'}")
 
 # ---------------- Utility ----------------
 def perf_start():
@@ -3099,24 +3151,216 @@ def committed_route_heavy_throttle_active():
     return bool(PERF_THROTTLE_WHILE_ROUTE_COMMIT and route_commit_active and route_commit_kind != "dock")
 
 
+def adaptive_load_shedding_active():
+    """True when the previous controller loop was slower than the budget.
+
+    This does not affect collision checks or motor commands.  It only slows
+    advisory work: planner, non-safety mapping and debug rendering.
+    """
+    if not ADAPTIVE_LOAD_SHEDDING_ENABLED:
+        return False
+    try:
+        loop_last = float(last_perf_loop_ms or 0.0)
+    except Exception:
+        loop_last = 0.0
+    try:
+        loop_ema = float(perf_ema_ms.get("loop", 0.0))
+    except Exception:
+        loop_ema = 0.0
+    return bool(loop_last >= float(ADAPTIVE_LOAD_SHEDDING_LOOP_MS) or loop_ema >= float(ADAPTIVE_LOAD_SHEDDING_EMA_MS))
+
+
+def load_shedding_debug_text():
+    try:
+        if adaptive_load_shedding_active():
+            return f"load=shed loop={float(last_perf_loop_ms):.0f} ema={float(perf_ema_ms.get('loop', 0.0)):.0f}"
+        return f"load=normal loop={float(last_perf_loop_ms):.0f} ema={float(perf_ema_ms.get('loop', 0.0)):.0f}"
+    except Exception:
+        return "load=unknown"
+
+
+def adaptive_cadence(base_steps, multiplier):
+    base = max(1, int(base_steps))
+    if adaptive_load_shedding_active():
+        return max(base, int(base * max(1, int(multiplier))))
+    return base
+
+
 def effective_depth_map_update_steps():
-    return max(1, int(DEPTH_ROUTE_COMMIT_MAP_UPDATE_STEPS if committed_route_heavy_throttle_active() else DEPTH_MAP_UPDATE_STEPS))
+    base = int(DEPTH_ROUTE_COMMIT_MAP_UPDATE_STEPS if committed_route_heavy_throttle_active() else DEPTH_MAP_UPDATE_STEPS)
+    return max(1, adaptive_cadence(base, ADAPTIVE_LOAD_SHEDDING_MAPPING_MULT))
 
 
 def effective_cv_map_update_steps():
-    return max(1, int(CV_ROUTE_COMMIT_MAP_UPDATE_STEPS if committed_route_heavy_throttle_active() else CV_MAP_UPDATE_STEPS))
+    base = int(CV_ROUTE_COMMIT_MAP_UPDATE_STEPS if committed_route_heavy_throttle_active() else CV_MAP_UPDATE_STEPS)
+    return max(1, adaptive_cadence(base, ADAPTIVE_LOAD_SHEDDING_MAPPING_MULT))
 
 
 def effective_under_update_steps():
-    return max(1, int(UNDER_ROUTE_COMMIT_UPDATE_STEPS if committed_route_heavy_throttle_active() else UNDER_SURFACE_UPDATE_STEPS))
+    base = int(UNDER_ROUTE_COMMIT_UPDATE_STEPS if committed_route_heavy_throttle_active() else UNDER_SURFACE_UPDATE_STEPS)
+    return max(1, adaptive_cadence(base, ADAPTIVE_LOAD_SHEDDING_MAPPING_MULT))
 
 
 def effective_structural_update_steps():
-    return max(1, int(STRUCTURAL_ROUTE_COMMIT_UPDATE_STEPS if committed_route_heavy_throttle_active() else CV_MAP_UPDATE_STEPS))
+    base = int(STRUCTURAL_ROUTE_COMMIT_UPDATE_STEPS if committed_route_heavy_throttle_active() else CV_MAP_UPDATE_STEPS)
+    return max(1, adaptive_cadence(base, ADAPTIVE_LOAD_SHEDDING_MAPPING_MULT))
 
 
 def effective_window_update_steps():
-    return max(1, int(WINDOW_ROUTE_COMMIT_UPDATE_STEPS if committed_route_heavy_throttle_active() else WINDOW_UPDATE_STEPS))
+    base = int(WINDOW_ROUTE_COMMIT_UPDATE_STEPS if committed_route_heavy_throttle_active() else WINDOW_UPDATE_STEPS)
+    return max(1, adaptive_cadence(base, ADAPTIVE_LOAD_SHEDDING_WINDOW_MULT))
+
+
+def effective_planner_update_steps(base_steps):
+    return max(1, adaptive_cadence(base_steps, ADAPTIVE_LOAD_SHEDDING_PLANNER_MULT))
+
+
+
+def frontier_direct_mapping_mode_active():
+    """True while global frontier planning should be an occasional advisor.
+
+    In this mode the robot keeps deterministic forward/perimeter motion and the
+    expensive frontier selector is sampled by cadence or after meaningful travel.
+    This avoids the active=none/frontier-hold loop: a displayed frontier candidate
+    is not allowed to become the wheel owner until ROUTE_COMMIT accepts it.
+    """
+    if not FRONTIER_DIRECT_MAPPING_ENABLED:
+        return False
+    if route_commit_active or dock_return_active or dock_return_completed:
+        return False
+    if known_map_coverage_eval_active() or map_mature:
+        return False
+    if planner_intent != PLANNER_INTENT_EXPAND_MAP:
+        return False
+    try:
+        cov = float(last_coverage_percent or 0.0)
+    except Exception:
+        cov = 100.0
+    if cov >= float(FRONTIER_DIRECT_MAPPING_MAX_COVERAGE_PERCENT):
+        return False
+    try:
+        has_frontier_candidate = bool(
+            coverage_goal_kind == "frontier"
+            and coverage_route_kind == "frontier"
+            and coverage_goal_map is not None
+            and math.isfinite(float(coverage_route_cost))
+        )
+    except Exception:
+        has_frontier_candidate = False
+    return bool(has_frontier_candidate or int(last_frontier_cells or 0) >= int(EXPLORATION_FRONTIER_ONLY_MIN_FRONTIER_CELLS))
+
+
+def frontier_direct_mapping_safe(front, center, body_clearance):
+    if not frontier_direct_mapping_mode_active():
+        return False
+    try:
+        return bool(
+            front is not None
+            and center is not None
+            and body_clearance is not None
+            and float(front) >= float(FRONTIER_DIRECT_MAPPING_MIN_FRONT_CLEAR_M)
+            and float(center) >= float(FRONTIER_DIRECT_MAPPING_MIN_CENTER_CLEAR_M)
+            and float(body_clearance) >= float(FRONTIER_DIRECT_MAPPING_MIN_BODY_CLEAR_M)
+        )
+    except Exception:
+        return False
+
+
+def frontier_direct_mapping_unsafe(front, center, body_clearance):
+    """True when direct mapping is active but local RGB-D says: do not drive forward."""
+    if not frontier_direct_mapping_mode_active():
+        return False
+    try:
+        f = float(front) if front is not None else 0.0
+        c = float(center) if center is not None else 0.0
+        b = float(body_clearance) if body_clearance is not None else 0.0
+        return bool(
+            f < float(FRONTIER_DIRECT_UNSAFE_RECOVERY_FRONT_M)
+            or c < float(FRONTIER_DIRECT_UNSAFE_RECOVERY_FRONT_M)
+            or b < float(FRONTIER_DIRECT_UNSAFE_RECOVERY_BODY_M)
+        )
+    except Exception:
+        return False
+
+
+def start_frontier_direct_unsafe_recovery(front, center, left, right, body_clearance, route_reason):
+    """Recover from a route-less frontier/direct hold near an obstacle/wall.
+
+    This is not a random fallback.  It is a controlled recovery state used only
+    when the frontier/direct mapper has no committable route and local depth says
+    that ordinary forward motion is unsafe.  It blacklists the current frontier
+    viewpoint before turning so the planner does not select the same shadow point
+    again.
+    """
+    global frontier_direct_last_unsafe_recovery_at, frontier_direct_last_unsafe_recovery_debug
+    global frontier_only_stall_blacklists, frontier_only_last_blacklist_time, last_planner_update_step
+    global coverage_status, last_optional_block_reason
+    if not FRONTIER_DIRECT_UNSAFE_RECOVERY_ENABLED:
+        frontier_direct_last_unsafe_recovery_debug = "unsafeRecovery=off"
+        return False
+    if nav_state != NAV_FORWARD or route_commit_active or dock_return_active or dock_return_completed:
+        frontier_direct_last_unsafe_recovery_debug = f"unsafeRecovery=skip nav={nav_state}"
+        return False
+    if not frontier_direct_mapping_unsafe(front, center, body_clearance):
+        frontier_direct_last_unsafe_recovery_debug = "unsafeRecovery=not-unsafe"
+        return False
+    try:
+        now = float(robot.getTime())
+    except Exception:
+        now = 0.0
+    if now - float(frontier_direct_last_unsafe_recovery_at) < float(FRONTIER_DIRECT_UNSAFE_RECOVERY_COOLDOWN_SEC):
+        frontier_direct_last_unsafe_recovery_debug = f"unsafeRecovery=cooldown {now - float(frontier_direct_last_unsafe_recovery_at):.1f}s"
+        return False
+
+    try:
+        if coverage_goal_kind == "frontier" and coverage_goal_map is not None:
+            gx, gy = coverage_goal_map
+            register_map_target_blacklist(
+                int(gx), int(gy), "frontier",
+                f"frontier unsafe hold {str(route_reason)[:24]}",
+                ttl_sec=EXPLORATION_FRONTIER_ONLY_STALL_BLACKLIST_SEC,
+                radius_m=FRONTIER_DIRECT_UNSAFE_BLACKLIST_RADIUS_M,
+            )
+            frontier_only_stall_blacklists += 1
+            frontier_only_last_blacklist_time = now
+    except Exception:
+        pass
+    try:
+        maybe_mark_near_collision_hypothesis("frontier unsafe hold: " + str(route_reason)[:24])
+    except Exception:
+        pass
+
+    try:
+        side, side_reason = choose_explore_contact_turn_side(False, False, float(left), float(right))
+    except Exception:
+        try:
+            side = choose_explore_turn_side_by_depth(float(left), float(right))
+            side_reason = "depth fallback"
+        except Exception:
+            side, side_reason = 1.0, "default left"
+
+    frontier_direct_last_unsafe_recovery_at = now
+    frontier_direct_last_unsafe_recovery_debug = (
+        f"unsafeRecovery=start side={'L' if side > 0 else 'R'} "
+        f"F={float(front) if front is not None else -1.0:.2f} "
+        f"C={float(center) if center is not None else -1.0:.2f} "
+        f"B={float(body_clearance) if body_clearance is not None else -1.0:.2f}"
+    )
+    coverage_status = frontier_direct_last_unsafe_recovery_debug
+    last_optional_block_reason = "frontier-direct unsafe -> controlled recovery"
+    last_planner_update_step = -999999
+    return bool(start_contact_recovery(
+        side,
+        "frontier-depth",
+        f"frontier-direct unsafe: {side_reason}; {str(route_reason)[:40]}",
+        EXPLORE_CONTACT_BACKUP_GOAL_M,
+        EXPLORE_CONTACT_BACKUP_TIMEOUT_SEC,
+        PIVOT_TURN_ANGLE,
+        EXPLORE_CONTACT_FORWARD_VERIFY_M,
+        CONTACT_ESCAPE_VERIFY_SPEED,
+        FRONT_CONTACT_TRAP_FORWARD_TIMEOUT_SEC,
+        True,
+    ))
 
 
 def planner_update_due():
@@ -3135,19 +3379,41 @@ def planner_update_due():
             # route is already the owner of motion. We still occasionally call
             # update_coverage_objective(); in known-map freeze mode it only
             # refreshes coverage percentages and mirrors the active route for HUD.
-            cadence = max(1, int(KNOWN_MAP_EVAL_ACTIVE_METRICS_UPDATE_STEPS))
+            cadence = effective_planner_update_steps(max(1, int(KNOWN_MAP_EVAL_ACTIVE_METRICS_UPDATE_STEPS)))
             due = (step_id % cadence) == 0
             last_planner_update_reason = f"known-sweep metrics {cadence}" if due else f"known-sweep frozen {cadence}"
             return bool(due)
-        cadence = max(1, int(PLANNER_ROUTE_COMMIT_UPDATE_STEPS))
+        cadence = effective_planner_update_steps(max(1, int(PLANNER_ROUTE_COMMIT_UPDATE_STEPS)))
         due = (step_id % cadence) == 0
         last_planner_update_reason = f"commit cadence {cadence}" if due else f"commit skip {cadence}"
         return bool(due)
     if (not route_commit_active) and route_commit_last_abort_time > -900.0 and (now - route_commit_last_abort_time) <= PLANNER_POST_ABORT_FORCE_SEC:
-        if step_id - last_planner_update_step >= max(8, int(PLANNER_UPDATE_STEPS // 4)):
+        if step_id - last_planner_update_step >= effective_planner_update_steps(max(8, int(PLANNER_UPDATE_STEPS // 4))):
             last_planner_update_reason = "post-abort force"
             return True
-    cadence = max(1, int(PLANNER_UPDATE_STEPS))
+
+    if frontier_direct_mapping_mode_active():
+        cadence = effective_planner_update_steps(max(int(PLANNER_UPDATE_STEPS), int(FRONTIER_DIRECT_MAPPING_PLANNER_STEPS)))
+        try:
+            moved = math.hypot(float(pose_x) - float(last_planner_update_x), float(pose_y) - float(last_planner_update_y))
+        except Exception:
+            moved = 0.0
+        # When the robot is stopped/held near a bad frontier, do not burn CPU
+        # replanning the same unsafe candidate every few seconds. Recovery and
+        # blacklist are the correct owner transitions; planner can wait longer.
+        if moved < float(FRONTIER_DIRECT_MAPPING_STOPPED_MOVE_EPS_M):
+            cadence = max(cadence, effective_planner_update_steps(int(FRONTIER_DIRECT_MAPPING_MIN_REPLAN_STEPS_WHEN_STOPPED)))
+        due = bool(
+            step_id - last_planner_update_step >= cadence
+            or moved >= float(FRONTIER_DIRECT_MAPPING_FORCE_REPLAN_DIST_M)
+        )
+        last_planner_update_reason = (
+            f"frontier-direct cadence {cadence} moved={moved:.2f}"
+            if due else f"frontier-direct skip {cadence} moved={moved:.2f}"
+        )
+        return bool(due)
+
+    cadence = effective_planner_update_steps(max(1, int(PLANNER_UPDATE_STEPS)))
     due = (step_id % cadence) == 0
     last_planner_update_reason = f"normal {cadence}" if due else f"normal skip {cadence}"
     return bool(due)
@@ -3177,7 +3443,7 @@ def mapping_update_cadences():
         "cv": effective_cv_map_update_steps(),
         "under": effective_under_update_steps(),
         "struct": effective_structural_update_steps(),
-        "noise": max(1, int(RAW_MAP_SPECKLE_CLEANUP_STEPS)),
+        "noise": effective_planner_update_steps(max(1, int(RAW_MAP_SPECKLE_CLEANUP_STEPS))),
     }
 
 
@@ -3227,11 +3493,16 @@ def append_current_trajectory_point():
 
 
 def run_planner_stage():
-    global last_planner_update_step
+    global last_planner_update_step, last_planner_update_x, last_planner_update_y
     refresh_navigation_phase()
     if planner_update_due():
         update_coverage_objective()
         last_planner_update_step = int(step_id)
+        try:
+            last_planner_update_x = float(pose_x)
+            last_planner_update_y = float(pose_y)
+        except Exception:
+            pass
         refresh_navigation_phase()
 
 
@@ -3247,17 +3518,52 @@ def save_frame_if_due(frame):
         cv2.imwrite(str(frames_dir / f"frame_{step_id:06d}.png"), frame)
 
 
+def heavy_debug_render_due():
+    """Throttle heavy map rendering separately from the viewer process.
+
+    Step120 moved imshow/waitKey away from the controller, but render_coverage_
+    planner_map() still runs in main and calls compute_coverage_masks().  This
+    function keeps debug images human-readable without treating them as real-time
+    control work.
+    """
+    if not FAST_DEBUG_RENDER_ENABLED:
+        return True
+    try:
+        base = int(FAST_DEBUG_RENDER_ROUTE_STEPS if route_commit_active else FAST_DEBUG_RENDER_MIN_STEPS)
+    except Exception:
+        base = int(FAST_DEBUG_RENDER_MIN_STEPS)
+    cadence = effective_planner_update_steps(max(base, effective_window_update_steps()))
+    return bool((step_id % cadence) == 0)
+
+
 def show_map_windows(frame, depth):
+    global last_debug_viewer_status, last_render_throttle_debug
     if task_due(effective_window_update_steps()):
         t0 = perf_start()
-        if SHOW_RGB_DEBUG_WINDOW:
-            cv2.imshow("RGB camera + depth debug", draw_cv_debug(frame, depth))
-        if SHOW_OCCUPANCY_MAP_WINDOW:
-            cv2.imshow("Persistent occupancy map", render_map(auto_crop=True))
-        if SHOW_COVERAGE_PLANNER_WINDOW:
-            cv2.imshow("Coverage objective map", render_coverage_planner_map(auto_crop=True))
+        rendered_windows = []
+        allow_heavy_render = heavy_debug_render_due()
+        if allow_heavy_render:
+            if SHOW_RGB_DEBUG_WINDOW:
+                rendered_windows.append(("RGB camera + depth debug", draw_cv_debug(frame, depth), (480, 360)))
+            if SHOW_OCCUPANCY_MAP_WINDOW:
+                rendered_windows.append(("Persistent occupancy map", render_map(auto_crop=True), (MAP_VIEW_W, MAP_VIEW_H)))
+            if SHOW_COVERAGE_PLANNER_WINDOW:
+                rendered_windows.append(("Coverage objective map", render_coverage_planner_map(auto_crop=True), (MAP_VIEW_W, MAP_VIEW_H + 132)))
+            last_render_throttle_debug = f"render=draw step={step_id}"
+        else:
+            last_render_throttle_debug = f"render=skip step={step_id}"
+        if ASYNC_DEBUG_VIEWER_ENABLED and debug_viewer_client is not None:
+            if rendered_windows and debug_viewer_client.submit(rendered_windows):
+                last_debug_viewer_status = f"viewer=async queued={len(rendered_windows)}"
+            elif rendered_windows:
+                last_debug_viewer_status = "viewer=async drop"
+            else:
+                last_debug_viewer_status = "viewer=async idle"
+        else:
+            for name, image, _size in rendered_windows:
+                cv2.imshow(name, image)
+            last_debug_viewer_status = f"viewer=sync shown={len(rendered_windows)}" if rendered_windows else "viewer=sync idle"
         perf_end("render", t0)
-
 
 def set_map_zoom(factor):
     global map_view_zoom
@@ -3298,10 +3604,16 @@ def reset_map_view():
 
 
 def close_map_windows():
-    global SHOW_WINDOWS
-    cv2.destroyAllWindows()
+    global SHOW_WINDOWS, debug_viewer_client, last_debug_viewer_status
+    if debug_viewer_client is not None:
+        try:
+            debug_viewer_client.close()
+        except Exception:
+            pass
+    else:
+        cv2.destroyAllWindows()
     SHOW_WINDOWS = False
-
+    last_debug_viewer_status = "viewer=closed"
 
 def handle_window_key(key):
     if key == 255:
@@ -3343,9 +3655,11 @@ def run_window_stage(frame, depth):
     if not SHOW_WINDOWS:
         return
     show_map_windows(frame, depth)
-    handle_window_key(cv2.waitKey(1) & 0xFF)
-
-
+    if ASYNC_DEBUG_VIEWER_ENABLED and debug_viewer_client is not None:
+        for key in debug_viewer_client.poll_keys():
+            handle_window_key(key)
+    else:
+        handle_window_key(cv2.waitKey(1) & 0xFF)
 
 def current_owner_source_label():
     """Human-readable source of the command that currently owns the wheels."""
@@ -3371,6 +3685,15 @@ def current_owner_source_label():
                 cov = 100.0
             if str(owner) == ControlOwner.ROUTE_COMMIT.value and coverage_route_kind == "frontier":
                 return "frontier-route"
+            if str(owner) in (ControlOwner.NONE.value, ControlOwner.PLANNER.value):
+                if str(last_frontier_only_gate_debug).startswith("frontierGate=hold") or str(last_frontier_only_gate_debug).startswith("frontierGate=waitRoute"):
+                    return "frontier-hold"
+                if str(last_frontier_only_gate_debug).startswith("frontierGate=unsafeRecovery"):
+                    return "recovery"
+                if frontier_direct_mapping_mode_active() and str(last_frontier_only_gate_debug).startswith("frontierGate=direct"):
+                    return "frontier-direct"
+            if frontier_direct_mapping_mode_active() and str(owner) == ControlOwner.ROW_FORWARD.value:
+                return "frontier-direct"
             if cov < float(EXPLORATION_FRONTIER_ONLY_MIN_COVERAGE_PERCENT) and str(owner) in (ControlOwner.NONE.value, ControlOwner.PLANNER.value, ControlOwner.ROW_FORWARD.value):
                 return "bootstrap-row"
             if str(owner) in (ControlOwner.NONE.value, ControlOwner.PLANNER.value):
@@ -3401,7 +3724,7 @@ def compact_debug_status_line():
         f"{runtime_arena_guard_debug[:24]} {odom_arena_clamp_debug[:22]} {frontier_route_abort_hold_debug[:24]} "
         f"{last_hypothesis_obstacle_debug[:28]} {last_near_collision_hypothesis_debug[:22]} "
         f"plan={last_planning_layer_debug[:34]} "
-        f"scan={last_active_scan_debug[:28]} gate={last_frontier_only_gate_debug[:30]} occ={last_rgbd_occlusion_debug[:18]}"
+        f"scan={last_active_scan_debug[:28]} gate={last_frontier_only_gate_debug[:30]} occ={last_rgbd_occlusion_debug[:18]} {last_debug_viewer_status[:22]} {last_render_throttle_debug[:18]} {load_shedding_debug_text()[:24]}"
     )
 
 
@@ -3421,7 +3744,7 @@ def verbose_debug_status_line():
         f"scan={last_active_scan_debug}, gate={last_frontier_only_gate_debug}, "
         f"arena={runtime_arena_guard_debug}, odom={odom_arena_clamp_debug}, hold={frontier_route_abort_hold_debug}, "
         f"hyp={last_hypothesis_obstacle_debug}, near={last_near_collision_hypothesis_debug}, "
-        f"occ={last_rgbd_occlusion_debug}, {last_perf_debug}"
+        f"occ={last_rgbd_occlusion_debug}, {last_debug_viewer_status}, {last_render_throttle_debug}, {load_shedding_debug_text()}, {last_perf_debug}"
     )
 
 
@@ -9566,6 +9889,10 @@ def active_rgbd_scan_need(front, body_clearance):
     if nav_action_queue:
         last_active_scan_debug = "scan=skip queue"
         return False, "action queue"
+    if frontier_direct_mapping_safe(front, front, body_clearance):
+        last_active_scan_debug = "scan=skip frontier-direct"
+        return False, "frontier direct mapping"
+
     if ACTIVE_SCAN_RESPECT_ROUTE_CANDIDATE_ENABLED:
         try:
             route_cost = float(coverage_route_cost)
@@ -9696,7 +10023,7 @@ def frontier_only_stall_watchdog_update(route_present, route_reason, safe_snapsh
     return "none"
 
 
-def exploration_frontier_only_owner_gate(front, center, body_clearance):
+def exploration_frontier_only_owner_gate(front, center, body_clearance, left=None, right=None):
     """Block ROW_FORWARD/coverage fallback during late partial EXPAND_MAP.
 
     This is intentionally placed after ROUTE_COMMIT and active-scan attempts in
@@ -9761,7 +10088,7 @@ def exploration_frontier_only_owner_gate(front, center, body_clearance):
             route_ok, route_reason = coverage_candidate_is_committable(front, center, body_clearance)
         except Exception as exc:
             route_ok, route_reason = False, f"committable err {type(exc).__name__}"
-    if route_ok:
+    if route_ok and FRONTIER_DIRECT_MAPPING_HOLD_IF_ROUTE_OK:
         # route_commit_speeds() should take this on the next control cycle; do not
         # start ROW_FORWARD in between if a stale ROW lock exists.
         try:
@@ -9774,6 +10101,27 @@ def exploration_frontier_only_owner_gate(front, center, body_clearance):
         last_frontier_only_gate_debug = f"frontierGate=waitRoute cost={coverage_route_cost:.2f}"
         last_planner_update_step = -999999
         return True
+
+    if frontier_direct_mapping_safe(front, center, body_clearance):
+        # No active ROUTE_COMMIT means the frontier candidate is only an advisor.
+        # Let the deterministic forward/perimeter controller collect more RGB-D
+        # evidence; the heavy planner is throttled by frontier_direct_mapping_mode_active().
+        coverage_status = f"frontier-direct: defer {str(route_reason)[:44]} fr={frontiers} cov={cov:.1f}"
+        last_optional_block_reason = "frontier candidate not committed -> direct mapping"
+        last_frontier_only_gate_debug = (
+            f"frontierGate=direct route={int(route_present)} "
+            f"cost={float(coverage_route_cost) if math.isfinite(float(coverage_route_cost)) else -1.0:.2f} "
+            f"fr={frontiers} cov={cov:.1f}"
+        )
+        return False
+
+    if frontier_direct_mapping_unsafe(front, center, body_clearance):
+        if start_frontier_direct_unsafe_recovery(front, center, left, right, body_clearance, route_reason):
+            last_frontier_only_gate_debug = (
+                f"frontierGate=unsafeRecovery route={int(route_present)} "
+                f"{frontier_direct_last_unsafe_recovery_debug}"
+            )
+            return True
 
     # Clear hidden row/coverage ownership before it reaches forward_owner_guard().
     try:
@@ -9827,7 +10175,6 @@ def exploration_frontier_only_owner_gate(front, center, body_clearance):
     coverage_status = f"frontier-only hold: {str(route_reason)[:52]} fr={frontiers} cov={cov:.1f}"
     last_optional_block_reason = "frontier-only blocks ROW_FORWARD"
     last_frontier_only_gate_debug = f"frontierGate=hold route={int(route_present)} {str(route_reason)[:28]} {frontier_only_last_stall_debug}"
-    last_planner_update_step = -999999
     return True
 
 
@@ -17994,7 +18341,7 @@ def route_and_perception_owner_speeds(front, center, upper_front, left, right, b
         start_active_rgbd_scan(scan_reason)
         return 0.0, 0.0
 
-    if exploration_frontier_only_owner_gate(front, center, body_clearance):
+    if exploration_frontier_only_owner_gate(front, center, body_clearance, left, right):
         return 0.0, 0.0
 
     if known_map_coverage_eval_active() and KNOWN_MAP_EVAL_STOP_IF_NO_ROUTE and nav_state == NAV_FORWARD:
@@ -20055,7 +20402,7 @@ def render_coverage_planner_map(auto_crop=True):
                 f"Coverage: {last_coverage_percent:.1f}% ({last_coverage_cleaned_cells}/{last_coverage_total_cells}) | conf={planner_confidence} intent={planner_intent} | {mode_text}",
                 (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (0, 0, 0), 1, cv2.LINE_AA)
     cv2.putText(canvas,
-                f"phase={navigation_phase} | nav={nav_state} | owner={last_control_owner_debug[:18]} | {owner_source_debug()[:22]} | {last_mapping_write_debug[:30]} | {last_post_turn_snapshot_debug[:16]}",
+                f"phase={navigation_phase} | nav={nav_state} | owner={last_control_owner_debug[:18]} | {owner_source_debug()[:22]} | {last_mapping_write_debug[:30]} | {load_shedding_debug_text()[:18]}",
                 (12, 49), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (0, 0, 0), 1, cv2.LINE_AA)
     cv2.putText(canvas,
                 f"candidate={route_commit_candidate_debug()} | active={route_commit_active_target_debug()} | route={coverage_route_status[:34]} | dock={dock_return_status[:18]} | {auto_map_ready_debug[:24]}",
@@ -20354,15 +20701,20 @@ def reset_map():
 
 # ---------------- Main loop ----------------
 if SHOW_WINDOWS:
-    if SHOW_RGB_DEBUG_WINDOW:
-        cv2.namedWindow("RGB camera + depth debug", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("RGB camera + depth debug", 480, 360)
-    if SHOW_OCCUPANCY_MAP_WINDOW:
-        cv2.namedWindow("Persistent occupancy map", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Persistent occupancy map", MAP_VIEW_W, MAP_VIEW_H)
-    if SHOW_COVERAGE_PLANNER_WINDOW:
-        cv2.namedWindow("Coverage objective map", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Coverage objective map", MAP_VIEW_W, MAP_VIEW_H + 132)
+    if ASYNC_DEBUG_VIEWER_ENABLED:
+        debug_viewer_client = AsyncDebugViewerClient(Path(__file__).with_name("async_debug_viewer.py"), enabled=True)
+        last_debug_viewer_status = "viewer=async started" if debug_viewer_client.alive() else "viewer=async failed"
+        print(f"Async debug viewer: {last_debug_viewer_status}")
+    else:
+        if SHOW_RGB_DEBUG_WINDOW:
+            cv2.namedWindow("RGB camera + depth debug", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("RGB camera + depth debug", 480, 360)
+        if SHOW_OCCUPANCY_MAP_WINDOW:
+            cv2.namedWindow("Persistent occupancy map", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("Persistent occupancy map", MAP_VIEW_W, MAP_VIEW_H)
+        if SHOW_COVERAGE_PLANNER_WINDOW:
+            cv2.namedWindow("Coverage objective map", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("Coverage objective map", MAP_VIEW_W, MAP_VIEW_H + 132)
 
 if known_map_coverage_eval_active():
     seed_known_map_coverage_eval(reason="startup")
