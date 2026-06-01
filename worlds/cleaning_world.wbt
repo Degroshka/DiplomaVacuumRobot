@@ -1,0 +1,479 @@
+#VRML_SIM R2025a utf8
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackground.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/floors/protos/RectangleArena.proto"
+
+WorldInfo {
+  title "Indoor RGB-D cleaning robot navigation scene"
+  basicTimeStep 32
+  coordinateSystem "ENU"
+}
+Viewpoint {
+  orientation 0.362 0.863 0.352 4.189
+  position 4.8 -6.3 4.2
+}
+TexturedBackground { }
+TexturedBackgroundLight { }
+
+# Large bounded apartment-like room. The floor is intentionally not plain:
+# visual SLAM needs corners, texture, contrast, and non-repeating landmarks.
+RectangleArena {
+  floorSize 9 7
+  wallHeight 1.2
+  floorTileSize 1 1
+  floorAppearance PBRAppearance {
+    baseColor 0.72 0.70 0.64
+    roughness 0.9
+    metalness 0
+  }
+  wallAppearance PBRAppearance {
+    baseColor 0.86 0.86 0.82
+    roughness 0.8
+  }
+}
+
+# Visual landmarks on walls: high contrast objects help visual navigation features.
+Solid {
+  translation -3.8 3.43 0.65
+  rotation 1 0 0 1.5708
+  name "blue_wall_marker"
+  children [
+    Shape { appearance PBRAppearance { baseColor 0.05 0.18 0.9 roughness 0.6 } geometry Box { size 0.75 0.04 0.45 } }
+  ]
+}
+Solid {
+  translation -1.2 3.43 0.7
+  rotation 1 0 0 1.5708
+  name "orange_wall_marker"
+  children [
+    Shape { appearance PBRAppearance { baseColor 1.0 0.45 0.05 roughness 0.6 } geometry Box { size 0.65 0.04 0.42 } }
+  ]
+}
+Solid {
+  translation 2.4 3.43 0.78
+  rotation 1 0 0 1.5708
+  name "green_wall_marker"
+  children [
+    Shape { appearance PBRAppearance { baseColor 0.05 0.65 0.22 roughness 0.6 } geometry Box { size 0.85 0.04 0.50 } }
+  ]
+}
+
+# Carpet with asymmetric colors and corners for feature extraction.
+Solid {
+  translation -1.3 -1.0 0.004
+  name "asymmetric_carpet"
+  children [
+    Shape { appearance PBRAppearance { baseColor 0.20 0.24 0.28 roughness 1 } geometry Box { size 2.2 1.25 0.008 } }
+    Transform { translation -0.45 0.18 0.005 children [ Shape { appearance PBRAppearance { baseColor 0.82 0.82 0.78 roughness 1 } geometry Box { size 0.55 0.08 0.002 } } ] }
+    Transform { translation 0.55 -0.30 0.005 children [ Shape { appearance PBRAppearance { baseColor 0.95 0.55 0.10 roughness 1 } geometry Box { size 0.45 0.10 0.002 } } ] }
+  ]
+  # Visual-only carpet: it stays visible to the RGB camera for feature extraction,
+  # but it is not a collision obstacle.  A real robot-vacuum should be able to
+  # drive onto a carpet; the navigation code must reject carpet texture visually,
+  # not rely on a physical blocking box.
+}
+
+# Furniture / obstacles: different height, size and colors for CV testing.
+Solid {
+  translation -3.0 -2.0 0.32
+  name "low_sofa"
+  children [
+    Shape { appearance PBRAppearance { baseColor 0.22 0.25 0.36 roughness 0.85 } geometry Box { size 1.9 0.75 0.55 } }
+    Transform { translation 0 0.37 0.28 children [ Shape { appearance PBRAppearance { baseColor 0.16 0.18 0.26 roughness 0.9 } geometry Box { size 1.9 0.12 0.45 } } ] }
+  ]
+  boundingObject Box { size 1.9 0.75 0.55 }
+}
+# Open-under table made from separate solids. It is intentionally NOT a solid block:
+# the robot can clean under the tabletop if it fits between the legs. This is a
+# better test for a vacuum cleaner than the earlier one-piece table collision box.
+Solid {
+  translation 1.9 -2.0 0.70
+  name "real_table_top_open_under"
+  children [
+    Shape { appearance PBRAppearance { baseColor 0.52 0.32 0.16 roughness 0.7 } geometry Box { size 1.30 0.85 0.08 } }
+  ]
+  boundingObject Box { size 1.30 0.85 0.08 }
+}
+Solid {
+  translation 1.35 -2.35 0.34
+  name "real_table_leg_front_left"
+  children [ Shape { appearance PBRAppearance { baseColor 0.34 0.20 0.10 roughness 0.75 } geometry Box { size 0.07 0.07 0.68 } } ]
+  boundingObject Box { size 0.07 0.07 0.68 }
+}
+Solid {
+  translation 2.45 -2.35 0.34
+  name "real_table_leg_front_right"
+  children [ Shape { appearance PBRAppearance { baseColor 0.34 0.20 0.10 roughness 0.75 } geometry Box { size 0.07 0.07 0.68 } } ]
+  boundingObject Box { size 0.07 0.07 0.68 }
+}
+Solid {
+  translation 1.35 -1.65 0.34
+  name "real_table_leg_back_left"
+  children [ Shape { appearance PBRAppearance { baseColor 0.34 0.20 0.10 roughness 0.75 } geometry Box { size 0.07 0.07 0.68 } } ]
+  boundingObject Box { size 0.07 0.07 0.68 }
+}
+Solid {
+  translation 2.45 -1.65 0.34
+  name "real_table_leg_back_right"
+  children [ Shape { appearance PBRAppearance { baseColor 0.34 0.20 0.10 roughness 0.75 } geometry Box { size 0.07 0.07 0.68 } } ]
+  boundingObject Box { size 0.07 0.07 0.68 }
+}
+
+# Chair/stool model for testing cleaning under furniture. The seat and back are
+# high enough for the low robot body; the four legs are real obstacles.
+Solid {
+  translation 2.65 -0.70 0.34
+  name "real_chair_seat_open_under"
+  children [
+    Shape { appearance PBRAppearance { baseColor 0.75 0.54 0.28 roughness 0.75 } geometry Box { size 0.58 0.58 0.07 } }
+  ]
+  boundingObject Box { size 0.58 0.58 0.07 }
+}
+Solid {
+  translation 2.94 -0.70 0.66
+  name "real_chair_backrest"
+  children [
+    Shape { appearance PBRAppearance { baseColor 0.55 0.35 0.18 roughness 0.8 } geometry Box { size 0.06 0.58 0.64 } }
+  ]
+  boundingObject Box { size 0.06 0.58 0.64 }
+}
+Solid {
+  translation 2.44 -0.91 0.17
+  name "real_chair_leg_fl"
+  children [ Shape { appearance PBRAppearance { baseColor 0.34 0.20 0.10 roughness 0.75 } geometry Box { size 0.055 0.055 0.34 } } ]
+  boundingObject Box { size 0.055 0.055 0.34 }
+}
+Solid {
+  translation 2.86 -0.91 0.17
+  name "real_chair_leg_fr"
+  children [ Shape { appearance PBRAppearance { baseColor 0.34 0.20 0.10 roughness 0.75 } geometry Box { size 0.055 0.055 0.34 } } ]
+  boundingObject Box { size 0.055 0.055 0.34 }
+}
+Solid {
+  translation 2.44 -0.49 0.17
+  name "real_chair_leg_bl"
+  children [ Shape { appearance PBRAppearance { baseColor 0.34 0.20 0.10 roughness 0.75 } geometry Box { size 0.055 0.055 0.34 } } ]
+  boundingObject Box { size 0.055 0.055 0.34 }
+}
+Solid {
+  translation 2.86 -0.49 0.17
+  name "real_chair_leg_br"
+  children [ Shape { appearance PBRAppearance { baseColor 0.34 0.20 0.10 roughness 0.75 } geometry Box { size 0.055 0.055 0.34 } } ]
+  boundingObject Box { size 0.055 0.055 0.34 }
+}
+
+Solid {
+  translation 3.35 1.25 0.62
+  name "white_cabinet"
+  children [
+    Shape { appearance PBRAppearance { baseColor 0.88 0.88 0.82 roughness 0.6 } geometry Box { size 0.65 1.35 1.2 } }
+    Transform { translation -0.335 0 0.08 children [ Shape { appearance PBRAppearance { baseColor 0.05 0.05 0.05 roughness 0.4 } geometry Box { size 0.02 1.20 0.08 } } ] }
+  ]
+  boundingObject Box { size 0.65 1.35 1.2 }
+}
+Solid {
+  translation -0.15 1.35 0.21
+  name "cardboard_box"
+  children [ Shape { appearance PBRAppearance { baseColor 0.65 0.47 0.25 roughness 0.95 } geometry Box { size 0.65 0.55 0.42 } } ]
+  boundingObject Box { size 0.65 0.55 0.42 }
+}
+Solid {
+  translation 0.9 0.15 0.17
+  name "black_low_obstacle"
+  children [ Shape { appearance PBRAppearance { baseColor 0.04 0.04 0.04 roughness 0.9 } geometry Box { size 0.38 0.38 0.34 } } ]
+  boundingObject Box { size 0.38 0.38 0.34 }
+}
+Solid {
+  translation -2.4 1.35 0.23
+  name "round_bin"
+  children [ Shape { appearance PBRAppearance { baseColor 0.1 0.45 0.38 roughness 0.8 } geometry Cylinder { radius 0.28 height 0.46 } } ]
+  boundingObject Cylinder { radius 0.28 height 0.46 }
+}
+Solid {
+  translation 2.6 2.35 0.05
+  name "small_floor_object"
+  children [ Shape { appearance PBRAppearance { baseColor 0.85 0.08 0.08 roughness 0.6 } geometry Box { size 0.28 0.18 0.10 } } ]
+  boundingObject Box { size 0.28 0.18 0.10 }
+}
+
+# Robot: no lidar. It uses a front RGB camera + front RangeFinder depth sensor for visual navigation and persistent mapping.
+# The RGB-D sensors are integrated into the front shell instead of floating in front of the robot.
+# The thin bumper pads are nearly flush with the circular body: they are contact safety, not navigation sensors.
+# Step13: pads are thinner/lighter and protrude only a few millimeters so they do not block 90-degree pivots.
+# Wheels are embedded into the vacuum body: most of each wheel is hidden by the body skirt, only the lower arc touches the floor.
+# Step22: front support is a passive free ball caster.
+# The previous fixed skid/sphere was attached to the robot body, so during yaw pivots
+# it scraped sideways and could stop the robot at 85-89 degrees.  The ball caster is
+# a separate Solid connected by a BallJoint, so the sphere can rotate freely in any
+# horizontal direction while still supporting the nose.
+# Visual-only dock station on the left wall: realistic home base near a power outlet.
+# It has no boundingObject, so it does not interfere with navigation or mapping.
+Solid {
+  translation -4.46 2.75 0.03
+  name "dock_station"
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.10 0.10 0.10 roughness 0.55 metalness 0.0 }
+      geometry Box { size 0.05 0.42 0.06 }
+    }
+    Transform {
+      translation 0.02 0 0.018
+      children [
+        Shape {
+          appearance PBRAppearance { baseColor 0.22 0.22 0.22 roughness 0.45 metalness 0.0 }
+          geometry Box { size 0.03 0.34 0.025 }
+        }
+      ]
+    }
+  ]
+}
+
+Robot {
+  translation -4.12 2.75 0.063
+  rotation 0 0 1 0.0
+  name "cleaning_robot_rgbd"
+  controller "rgbd_navigation_cleaner"
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.05 0.18 0.95 roughness 0.75 }
+      geometry Cylinder { radius 0.18 height 0.085 }
+    }
+    # Step64 recessed RGB-D aperture.
+    # The Camera + RangeFinder are depth/RGB sensors inside the circular shell.
+    # The front trim remains only visual; the physical collision cylinder stays
+    # in front of the optical origin so the sensor cannot clip through walls.
+    Transform {
+      translation 0.213 0.057 0.060
+      children [ Shape { appearance PBRAppearance { baseColor 0.02 0.02 0.02 roughness 0.5 } geometry Box { size 0.006 0.008 0.042 } } ]
+    }
+    Transform {
+      translation 0.213 -0.057 0.060
+      children [ Shape { appearance PBRAppearance { baseColor 0.02 0.02 0.02 roughness 0.5 } geometry Box { size 0.006 0.008 0.042 } } ]
+    }
+    Transform {
+      translation 0.213 0 0.083
+      children [ Shape { appearance PBRAppearance { baseColor 0.02 0.02 0.02 roughness 0.5 } geometry Box { size 0.006 0.104 0.006 } } ]
+    }
+    Transform {
+      translation 0.213 0 0.037
+      children [ Shape { appearance PBRAppearance { baseColor 0.02 0.02 0.02 roughness 0.5 } geometry Box { size 0.006 0.104 0.006 } } ]
+    }
+    Camera {
+      translation 0.215 0 0.060
+      rotation 0 -1 0 -5.31e-06
+      name "front_camera"
+      width 320
+      height 240
+      fieldOfView 1.22
+      near 0.01
+      far 10
+    }
+    RangeFinder {
+      translation 0.215 0 0.060
+      rotation 0 -1 0 -5.31e-06
+      name "front_range_finder"
+      width 120
+      height 36
+      fieldOfView 1.22
+      near 0.01
+      maxRange 6.0
+    }
+    # Yaw stabilization sensor. Distance is still computed from wheel encoders;
+    # the InertialUnit only prevents heading drift/slip from making the map lie.
+    InertialUnit {
+      name "inertial_unit"
+    }
+
+    # Step112 bumper geometry: bumper pads are now the foremost contact surfaces.
+    # Step111 wrapped the front arc visually, but the passive front sensor shell was still
+    # farther forward than the center bumper.  That allowed the rigid body/shell to take
+    # the collision before the TouchSensor fired.  These pads protrude beyond the passive
+    # shell and the circular body, while still staying low enough to avoid the RGB-D view.
+    TouchSensor {
+      name "front_center_bumper"
+      type "bumper"
+      children [
+        Transform {
+          translation 0.2320 0.0000 0.0120
+          rotation 0 0 1 0.00000
+          children [ Shape { appearance PBRAppearance { baseColor 0.02 1.00 0.20 roughness 0.70 } geometry Box { size 0.020 0.100 0.032 } } ]
+        }
+        Transform {
+          translation 0.2240 0.0580 0.0120
+          rotation 0 0 1 0.28000
+          children [ Shape { appearance PBRAppearance { baseColor 0.02 1.00 0.20 roughness 0.70 } geometry Box { size 0.018 0.054 0.032 } } ]
+        }
+        Transform {
+          translation 0.2240 -0.0580 0.0120
+          rotation 0 0 1 -0.28000
+          children [ Shape { appearance PBRAppearance { baseColor 0.02 1.00 0.20 roughness 0.70 } geometry Box { size 0.018 0.054 0.032 } } ]
+        }
+      ]
+      boundingObject Group {
+        children [
+          Transform {
+            translation 0.2320 0.0000 0.0120
+            rotation 0 0 1 0.00000
+            children [ Box { size 0.020 0.100 0.032 } ]
+          }
+          Transform {
+            translation 0.2240 0.0580 0.0120
+            rotation 0 0 1 0.28000
+            children [ Box { size 0.018 0.054 0.032 } ]
+          }
+          Transform {
+            translation 0.2240 -0.0580 0.0120
+            rotation 0 0 1 -0.28000
+            children [ Box { size 0.018 0.054 0.032 } ]
+          }
+        ]
+      }
+      physics Physics { density -1 mass 0.140 }
+    }
+    TouchSensor {
+      name "front_left_bumper"
+      type "bumper"
+      children [
+        Transform {
+          translation 0.2200 0.0860 0.0120
+          rotation 0 0 1 0.42000
+          children [ Shape { appearance PBRAppearance { baseColor 1.00 0.12 0.04 roughness 0.70 } geometry Box { size 0.018 0.066 0.032 } } ]
+        }
+        Transform {
+          translation 0.1940 0.1280 0.0120
+          rotation 0 0 1 0.77000
+          children [ Shape { appearance PBRAppearance { baseColor 1.00 0.12 0.04 roughness 0.70 } geometry Box { size 0.016 0.058 0.032 } } ]
+        }
+        Transform {
+          translation 0.1580 0.1640 0.0120
+          rotation 0 0 1 1.12000
+          children [ Shape { appearance PBRAppearance { baseColor 1.00 0.12 0.04 roughness 0.70 } geometry Box { size 0.014 0.050 0.032 } } ]
+        }
+      ]
+      boundingObject Group {
+        children [
+          Transform {
+            translation 0.2200 0.0860 0.0120
+            rotation 0 0 1 0.42000
+            children [ Box { size 0.018 0.066 0.032 } ]
+          }
+          Transform {
+            translation 0.1940 0.1280 0.0120
+            rotation 0 0 1 0.77000
+            children [ Box { size 0.016 0.058 0.032 } ]
+          }
+          Transform {
+            translation 0.1580 0.1640 0.0120
+            rotation 0 0 1 1.12000
+            children [ Box { size 0.014 0.050 0.032 } ]
+          }
+        ]
+      }
+      physics Physics { density -1 mass 0.095 }
+    }
+    TouchSensor {
+      name "front_right_bumper"
+      type "bumper"
+      children [
+        Transform {
+          translation 0.2200 -0.0860 0.0120
+          rotation 0 0 1 -0.42000
+          children [ Shape { appearance PBRAppearance { baseColor 1.00 0.12 0.04 roughness 0.70 } geometry Box { size 0.018 0.066 0.032 } } ]
+        }
+        Transform {
+          translation 0.1940 -0.1280 0.0120
+          rotation 0 0 1 -0.77000
+          children [ Shape { appearance PBRAppearance { baseColor 1.00 0.12 0.04 roughness 0.70 } geometry Box { size 0.016 0.058 0.032 } } ]
+        }
+        Transform {
+          translation 0.1580 -0.1640 0.0120
+          rotation 0 0 1 -1.12000
+          children [ Shape { appearance PBRAppearance { baseColor 1.00 0.12 0.04 roughness 0.70 } geometry Box { size 0.014 0.050 0.032 } } ]
+        }
+      ]
+      boundingObject Group {
+        children [
+          Transform {
+            translation 0.2200 -0.0860 0.0120
+            rotation 0 0 1 -0.42000
+            children [ Box { size 0.018 0.066 0.032 } ]
+          }
+          Transform {
+            translation 0.1940 -0.1280 0.0120
+            rotation 0 0 1 -0.77000
+            children [ Box { size 0.016 0.058 0.032 } ]
+          }
+          Transform {
+            translation 0.1580 -0.1640 0.0120
+            rotation 0 0 1 -1.12000
+            children [ Box { size 0.014 0.050 0.032 } ]
+          }
+        ]
+      }
+      physics Physics { density -1 mass 0.095 }
+    }
+
+    # Passive free ball caster.  This is not a fixed skid: the sphere is its own
+    # Solid on a BallJoint, so when the differential drive pivots in place the front
+    # support can roll in any direction instead of scraping sideways.  It should
+    # reduce the 85-89 degree pivot stall seen near walls.
+    BallJoint {
+      jointParameters BallJointParameters {
+        anchor 0.075 0 -0.049
+      }
+      endPoint Solid {
+        translation 0.075 0 -0.049
+        name "front_free_ball_caster"
+        children [
+          Shape {
+            appearance PBRAppearance { baseColor 0.015 0.015 0.015 roughness 0.45 }
+            geometry Sphere { radius 0.014 }
+          }
+        ]
+        boundingObject Sphere { radius 0.014 }
+        physics Physics { density -1 mass 0.006 }
+      }
+    }
+    HingeJoint {
+      jointParameters HingeJointParameters { axis 0 1 0 anchor 0 0.125 -0.008 }
+      device [ RotationalMotor { name "left wheel motor" maxVelocity 8.5 maxTorque 10.0 } PositionSensor { name "left wheel sensor" } ]
+      endPoint Solid {
+        translation 0 0.125 -0.008
+        rotation 1 0 0 1.5708
+        name "left_wheel"
+        children [ Shape { appearance PBRAppearance { baseColor 0 0 0 roughness 0.8 } geometry Cylinder { radius 0.055 height 0.024 } } ]
+        boundingObject Cylinder { radius 0.055 height 0.024 }
+        physics Physics { density -1 mass 0.045 }
+      }
+    }
+    HingeJoint {
+      jointParameters HingeJointParameters { axis 0 1 0 anchor 0 -0.125 -0.008 }
+      device [ RotationalMotor { name "right wheel motor" maxVelocity 8.5 maxTorque 10.0 } PositionSensor { name "right wheel sensor" } ]
+      endPoint Solid {
+        translation 0 -0.125 -0.008
+        rotation 1 0 0 1.5708
+        name "right_wheel"
+        children [ Shape { appearance PBRAppearance { baseColor 0 0 0 roughness 0.8 } geometry Cylinder { radius 0.055 height 0.024 } } ]
+        boundingObject Cylinder { radius 0.055 height 0.024 }
+        physics Physics { density -1 mass 0.045 }
+      }
+    }
+  ]
+  # Step97c: camera/RGB-D safety shell.  The optical origin is recessed to
+  # translation 0.215 0 0.060.  The physical shell is only a small margin in
+  # front of it, not a long artificial probe.  The main body stays circular for
+  # pivots; the narrow low front shell protects the sensor from wall-texture clipping.
+  boundingObject Group {
+    children [
+      Cylinder { radius 0.180 height 0.085 }
+      Transform {
+        # Step112: passive RGB-D shell is intentionally behind the TouchSensor pads.
+        # The bumpers must be the first collision elements; otherwise Webots can block
+        # the robot on this passive box while all bumper values stay zero.
+        translation 0.205 0 0.020
+        children [ Box { size 0.010 0.100 0.034 } ]
+      }
+    ]
+  }
+  physics Physics { density -1 mass 2.4 centerOfMass [0 0 -0.040] }
+}
