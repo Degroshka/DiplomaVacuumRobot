@@ -219,8 +219,13 @@ EXPLORATION_FRONTIER_ONLY_OWNER_GATE_ENABLED = True
 # local row/bootstrap controller to keep collecting RGB-D/depth evidence unless a
 # frontier ROUTE_COMMIT was already accepted.  This avoids active=none/STOP loops
 # and reduces planner churn on tiny early frontier fragments.
-EXPLORATION_FRONTIER_ONLY_MIN_COVERAGE_PERCENT = 22.0
-EXPLORATION_FRONTIER_ONLY_MIN_FRONTIER_CELLS = max(120, PLANNER_INTENT_MIN_FRONTIER_CELLS_EARLY // 2)
+# Step122: restore the step107-style hybrid ownership threshold.  Frontier is
+# still scored/planned in the background, but it must not hard-stop ordinary local
+# map-building rows until the map has a stable connected floor base.  The earlier
+# 22% threshold made noisy PARTIAL maps enter frontier-hold too soon.
+EXPLORATION_FRONTIER_ONLY_MIN_COVERAGE_PERCENT = 48.0
+EXPLORATION_FRONTIER_ONLY_MIN_FRONTIER_CELLS = PLANNER_INTENT_MIN_FRONTIER_CELLS_EARLY
+HYBRID_LOCAL_MOTION_RESTORE_ENABLED = True
 EXPLORATION_FRONTIER_SINGLE_POINT_COMMIT_ENABLED = True
 EXPLORATION_FRONTIER_SINGLE_POINT_MAX_COST_M = 0.90
 EXPLORATION_FRONTIER_SINGLE_POINT_MAX_STRAIGHT_M = 0.95
@@ -247,7 +252,7 @@ FRONTIER_DIRECT_UNSAFE_RECOVERY_BODY_M = 0.070
 FRONTIER_DIRECT_UNSAFE_RECOVERY_COOLDOWN_SEC = 5.0
 FRONTIER_DIRECT_UNSAFE_BLACKLIST_RADIUS_M = 0.86
 
-EXPLORATION_FRONTIER_ONLY_SNAPSHOT_COOLDOWN_SEC = 9.5
+EXPLORATION_FRONTIER_ONLY_SNAPSHOT_COOLDOWN_SEC = 4.8
 EXPLORATION_FRONTIER_ONLY_SNAPSHOT_MIN_FRONT_CLEAR_M = 0.30
 EXPLORATION_FRONTIER_ONLY_SNAPSHOT_MIN_BODY_CLEAR_M = 0.070
 # frontier.  If a candidate repeatedly leaves the robot stopped at the same pose,
@@ -255,14 +260,14 @@ EXPLORATION_FRONTIER_ONLY_SNAPSHOT_MIN_BODY_CLEAR_M = 0.070
 # no-progress plateau at acceptable map coverage, return to dock and let K-mode
 # work on the sanitized learned map instead of chasing obstacle-shadow unknowns.
 EXPLORATION_FRONTIER_ONLY_STALL_WATCHDOG_ENABLED = True
-EXPLORATION_FRONTIER_ONLY_STALL_TIMEOUT_SEC = 4.8
+EXPLORATION_FRONTIER_ONLY_STALL_TIMEOUT_SEC = 12.0
 EXPLORATION_FRONTIER_ONLY_STALL_POSE_EPS_M = 0.07
 EXPLORATION_FRONTIER_ONLY_STALL_HEADING_EPS_RAD = math.radians(18.0)
-EXPLORATION_FRONTIER_ONLY_STALL_RETURN_TIMEOUT_SEC = 65.0
+EXPLORATION_FRONTIER_ONLY_STALL_RETURN_TIMEOUT_SEC = 46.0
 EXPLORATION_FRONTIER_ONLY_STALL_RETURN_MIN_COVERAGE_PERCENT = 47.5
 EXPLORATION_FRONTIER_ONLY_STALL_BLACKLIST_RADIUS_M = 0.68
-EXPLORATION_FRONTIER_ONLY_STALL_BLACKLIST_SEC = 125.0
-EXPLORATION_FRONTIER_ONLY_STALL_MAX_BLACKLISTS_BEFORE_DOCK = 9
+EXPLORATION_FRONTIER_ONLY_STALL_BLACKLIST_SEC = 95.0
+EXPLORATION_FRONTIER_ONLY_STALL_MAX_BLACKLISTS_BEFORE_DOCK = 4
 FRONTIER_FALLBACK_DIRECT_ROUTE_ENABLED = True
 FRONTIER_FALLBACK_DIRECT_MAX_BLOCKED_RATIO = 0.16
 FRONTIER_FALLBACK_DIRECT_MAX_DIST_M = 1.55
@@ -3250,6 +3255,30 @@ def frontier_direct_mapping_mode_active():
     return bool(has_frontier_candidate or int(last_frontier_cells or 0) >= int(EXPLORATION_FRONTIER_ONLY_MIN_FRONTIER_CELLS))
 
 
+
+
+def hybrid_local_mapping_active(cov=None):
+    """True while local movement should be the default map-building owner.
+
+    Step107 moved better because frontier did not become a hard gate on a sparse
+    map.  Keep that behavior explicitly: until the coverage threshold is reached,
+    a non-committed frontier candidate is only an advisor.  ROUTE_COMMIT still has
+    priority because route_commit_speeds() runs before the owner gate.
+    """
+    if not HYBRID_LOCAL_MOTION_RESTORE_ENABLED:
+        return False
+    if route_commit_active or dock_return_active or dock_return_completed:
+        return False
+    if known_map_coverage_eval_active() or map_mature:
+        return False
+    if planner_intent != PLANNER_INTENT_EXPAND_MAP:
+        return False
+    try:
+        c = float(last_coverage_percent if cov is None else cov)
+    except Exception:
+        c = 100.0
+    return bool(matrix_first_explore_active() and c < float(EXPLORATION_FRONTIER_ONLY_MIN_COVERAGE_PERCENT))
+
 def frontier_direct_mapping_safe(front, center, body_clearance):
     if not frontier_direct_mapping_mode_active():
         return False
@@ -3690,12 +3719,16 @@ def current_owner_source_label():
                     return "frontier-hold"
                 if str(last_frontier_only_gate_debug).startswith("frontierGate=unsafeRecovery"):
                     return "recovery"
+                if hybrid_local_mapping_active(cov):
+                    return "hybrid-row"
                 if frontier_direct_mapping_mode_active() and str(last_frontier_only_gate_debug).startswith("frontierGate=direct"):
                     return "frontier-direct"
+            if hybrid_local_mapping_active(cov) and str(owner) == ControlOwner.ROW_FORWARD.value:
+                return "hybrid-row"
             if frontier_direct_mapping_mode_active() and str(owner) == ControlOwner.ROW_FORWARD.value:
                 return "frontier-direct"
             if cov < float(EXPLORATION_FRONTIER_ONLY_MIN_COVERAGE_PERCENT) and str(owner) in (ControlOwner.NONE.value, ControlOwner.PLANNER.value, ControlOwner.ROW_FORWARD.value):
-                return "bootstrap-row"
+                return "hybrid-row"
             if str(owner) in (ControlOwner.NONE.value, ControlOwner.PLANNER.value):
                 return "frontier-hold"
             if str(owner) in (ControlOwner.ROW_FORWARD.value, ControlOwner.GRID_REALIGN.value, ControlOwner.PIVOT_90.value):
@@ -10065,12 +10098,13 @@ def exploration_frontier_only_owner_gate(front, center, body_clearance, left=Non
         last_frontier_only_gate_debug = f"frontierGate=skip low-fr={frontiers}"
         return False
 
-    # Early bootstrap: before the map has a reliable connected free-space base,
-    # frontier-only STOP/hold is counterproductive and expensive.  route_commit_speeds()
-    # has already had first priority above; if it did not accept the candidate, let
-    # the local depth/bumper row controller move a little and collect more evidence.
-    if matrix_first_explore_active() and cov < float(EXPLORATION_FRONTIER_ONLY_MIN_COVERAGE_PERCENT):
-        last_frontier_only_gate_debug = f"frontierGate=bootstrap-row cov={cov:.1f}/{EXPLORATION_FRONTIER_ONLY_MIN_COVERAGE_PERCENT:.1f}"
+    # Hybrid local-map pass: before the map has a reliable connected free-space
+    # base, a frontier candidate is only advice.  ROUTE_COMMIT already had the
+    # first chance above; if it did not accept the route, let the local depth/bumper
+    # row controller keep moving and collect more RGB-D evidence instead of holding
+    # owner=NONE on a noisy/shadow frontier.
+    if hybrid_local_mapping_active(cov):
+        last_frontier_only_gate_debug = f"frontierGate=hybrid-row cov={cov:.1f}/{EXPLORATION_FRONTIER_ONLY_MIN_COVERAGE_PERCENT:.1f}"
         return False
 
     route_present = bool(
