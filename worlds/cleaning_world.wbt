@@ -199,9 +199,9 @@ Solid {
 # Robot: no lidar. It uses a front RGB camera + front RangeFinder depth sensor for visual navigation and persistent mapping.
 # The RGB-D sensors are integrated into the front shell instead of floating in front of the robot.
 # The thin bumper pads are nearly flush with the circular body: they are contact safety, not navigation sensors.
-# Step13: pads are thinner/lighter and protrude only a few millimeters so they do not block 90-degree pivots.
+# pads are thinner/lighter and protrude only a few millimeters so they do not block 90-degree pivots.
 # Wheels are embedded into the vacuum body: most of each wheel is hidden by the body skirt, only the lower arc touches the floor.
-# Step22: front support is a passive free ball caster.
+# front support is a passive free ball caster.
 # The previous fixed skid/sphere was attached to the robot body, so during yaw pivots
 # it scraped sideways and could stop the robot at 85-89 degrees.  The ball caster is
 # a separate Solid connected by a BallJoint, so the sphere can rotate freely in any
@@ -238,7 +238,7 @@ Robot {
       appearance PBRAppearance { baseColor 0.05 0.18 0.95 roughness 0.75 }
       geometry Cylinder { radius 0.18 height 0.085 }
     }
-    # Step64 recessed RGB-D aperture.
+    # recessed RGB-D aperture.
     # The Camera + RangeFinder are depth/RGB sensors inside the circular shell.
     # The front trim remains only visual; the physical collision cylinder stays
     # in front of the optical origin so the sensor cannot clip through walls.
@@ -284,8 +284,8 @@ Robot {
       name "inertial_unit"
     }
 
-    # Step112 bumper geometry: bumper pads are now the foremost contact surfaces.
-    # Step111 wrapped the front arc visually, but the passive front sensor shell was still
+    # bumper geometry: bumper pads are now the foremost contact surfaces.
+    # wrapped the front arc visually, but the passive front sensor shell was still
     # farther forward than the center bumper.  That allowed the rigid body/shell to take
     # the collision before the TouchSensor fired.  These pads protrude beyond the passive
     # shell and the circular body, while still staying low enough to avoid the RGB-D view.
@@ -459,7 +459,7 @@ Robot {
       }
     }
   ]
-  # Step97c: camera/RGB-D safety shell.  The optical origin is recessed to
+  # c: camera/RGB-D safety shell.  The optical origin is recessed to
   # translation 0.215 0 0.060.  The physical shell is only a small margin in
   # front of it, not a long artificial probe.  The main body stays circular for
   # pivots; the narrow low front shell protects the sensor from wall-texture clipping.
@@ -467,7 +467,7 @@ Robot {
     children [
       Cylinder { radius 0.180 height 0.085 }
       Transform {
-        # Step112: passive RGB-D shell is intentionally behind the TouchSensor pads.
+        # passive RGB-D shell is intentionally behind the TouchSensor pads.
         # The bumpers must be the first collision elements; otherwise Webots can block
         # the robot on this passive box while all bumper values stay zero.
         translation 0.205 0 0.020

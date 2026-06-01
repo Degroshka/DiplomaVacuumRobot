@@ -204,8 +204,7 @@ def compute_wall_follow_command(inp: WallFollowInput, cfg: WallFollowConfig = Wa
         reason_state = "near"
     elif err_dist > 0.0:
         # A depth-side "far" reading often means the wall is merely visible in
-        # the frontal RGB-D cone, not that it is a reliable side wall.  In step29
-        # this produced the visible pattern "go a little forward -> turn right"
+        # the frontal RGB-D cone, not that it is a reliable side wall.  In # this produced the visible pattern "go a little forward -> turn right"
         # because right-hand perimeter tracing kept pulling toward a 28-30 cm
         # oblique depth return.  Unless explicitly enabled, do not use depth-only
         # far evidence to acquire a wall; keep only the heading lock and let the

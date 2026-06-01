@@ -1,19 +1,16 @@
 # Cleanup manifest
 
-База: step112_bumper_foremost_shell_fix.
-
 Выполнено:
-- корневая папка переименована в `cleaning_robot_rgbd_navigation_webots`;
-- контроллер переименован в `rgbd_navigation_cleaner`;
-- основной файл контроллера переименован в `rgbd_navigation_cleaner.py`;
-- Robot name в WBT заменён на `cleaning_robot_rgbd`;
-- из пользовательских строк и комментариев убрано некорректное название;
-- удалены `_refs`, старые markdown-заметки, `.bak`-файлы, патчи, видео, ROS/URDF-заготовки и `__pycache__`;
-- оставлены только Webots world и controller files;
-- добавлены `README.md` и `requirements.txt`.
+- корневая папка называется `cleaning_robot_rgbd_navigation_webots`;
+- контроллер называется `rgbd_navigation_cleaner`;
+- Robot name в WBT: `cleaning_robot_rgbd`;
+- из пользовательских строк и комментариев убраны старые названия и patch-history markers;
+- удалены backup-файлы, старые markdown-заметки, `.bak`-файлы, патчи, видео, ROS/URDF-заготовки и `__pycache__`;
+- удалены пустые stub-модули без рабочей логики;
+- статические настройки вынесены в `controllers/rgbd_navigation_cleaner/config.py`;
+- оставлены только Webots world, controller files, README и requirements.
 
-Не менялось:
-- логика движения;
-- логика построения карты;
-- геометрия робота и бамперов из step112;
-- настройки камеры/RangeFinder из текущей рабочей версии.
+Не менялось намеренно:
+- Webots API, сенсоры и управление моторами остаются в основном контроллере;
+- runtime-state не вынесен в отдельный процесс, чтобы не получить рассинхрон карты, pose и owner;
+- RangeFinder по-прежнему описывается как depth-канал RGB-D системы, не лидар.
