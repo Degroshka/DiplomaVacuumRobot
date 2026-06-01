@@ -224,6 +224,8 @@ last_right_side_bumper = False
 last_contact_trap_reason = ""
 last_contact_trap_time = -999.0
 last_contact_map_cells = 0
+last_low_obstacle_memory_time = -999.0
+last_low_obstacle_memory_debug = "lowObs=idle"
 last_sensor_stall_time = -999.0
 last_stall_depth_signature = None
 last_stall_rgb_signature = None
@@ -1286,7 +1288,7 @@ def compact_debug_status_line():
         f"cand={route_commit_candidate_debug()} active={route_commit_active_target_debug()} "
         f"frontier={last_frontier_cells} {last_gray_gap_debug[:26]} {last_exploration_cleanup_lock_debug[:34]} "
         f"{runtime_arena_guard_debug[:24]} {odom_arena_clamp_debug[:22]} {frontier_route_abort_hold_debug[:24]} "
-        f"{last_hypothesis_obstacle_debug[:28]} {last_near_collision_hypothesis_debug[:22]} "
+        f"{last_hypothesis_obstacle_debug[:28]} {last_near_collision_hypothesis_debug[:22]} {last_low_obstacle_memory_debug[:22]} "
         f"plan={last_planning_layer_debug[:34]} "
         f"scan={last_active_scan_debug[:28]} gate={last_frontier_only_gate_debug[:30]} occ={last_rgbd_occlusion_debug[:18]} {last_debug_viewer_status[:22]} {last_render_throttle_debug[:18]} {load_shedding_debug_text()[:24]}"
     )
@@ -1307,7 +1309,7 @@ def verbose_debug_status_line():
         f"{last_exploration_cleanup_lock_debug}, plan={last_planning_layer_debug}, "
         f"scan={last_active_scan_debug}, gate={last_frontier_only_gate_debug}, "
         f"arena={runtime_arena_guard_debug}, odom={odom_arena_clamp_debug}, hold={frontier_route_abort_hold_debug}, "
-        f"hyp={last_hypothesis_obstacle_debug}, near={last_near_collision_hypothesis_debug}, "
+        f"hyp={last_hypothesis_obstacle_debug}, near={last_near_collision_hypothesis_debug}, low={last_low_obstacle_memory_debug}, "
         f"occ={last_rgbd_occlusion_debug}, {last_debug_viewer_status}, {last_render_throttle_debug}, {load_shedding_debug_text()}, {last_perf_debug}"
     )
 
@@ -2553,7 +2555,7 @@ def contact_recovery_manager_speeds(front, center, upper_front, left, right, bod
         if bumper_active:
             side = -1.0 if bumper_left and not bumper_right else (1.0 if bumper_right and not bumper_left else contact_recovery_side)
             obstacle_side = contact_obstacle_side_from_bumpers(bumper_left, bumper_right, left, right)
-            mark_contact_obstacle(obstacle_side, min(front, center, BODY_CORRIDOR_PASS_CLEARANCE))
+            mark_contact_or_low_obstacle(obstacle_side, min(front, center, BODY_CORRIDOR_PASS_CLEARANCE))
             start_contact_recovery(
                 side,
                 "front" if last_bumper_center or (bumper_left and bumper_right) else "side",
@@ -4522,6 +4524,84 @@ def mark_hypothesis_obstacle_at_world(wx, wy, radius_m=None, update=None, reason
         last_near_collision_hypothesis_debug = f"nearHyp=err {type(exc).__name__}"
         return False
 
+
+
+
+def mark_low_obstacle_memory(obstacle_side=0.0, distance=None, reason="low obstacle", force=False):
+    """Remember a low/contact-like obstacle that RGB-D/bumper handling may miss.
+
+    This is deliberately not a contact-confirmed cyan layer unless a real bumper
+    latch exists.  It writes a compact orange hypothesis plus normal obstacle
+    support so route/frontier planning stops sending the robot into the same
+    small red/low object after a recovery.  Use this for pre-contact guards,
+    odometry/sensor stalls and repeated unsafe holds.
+    """
+    global hypothesis_obstacle_log_odds, hypothesis_obstacle_cache_step, last_low_obstacle_memory_time
+    global last_low_obstacle_memory_debug, last_near_collision_hypothesis_debug
+    if not (OBSTACLE_HYPOTHESIS_ENABLED and LOW_OBSTACLE_MEMORY_ENABLED):
+        last_low_obstacle_memory_debug = "lowObs=off"
+        return False
+    try:
+        now = float(robot.getTime())
+        if (not force) and now - float(last_low_obstacle_memory_time) < float(LOW_OBSTACLE_MEMORY_COOLDOWN_SEC):
+            return False
+
+        # Place the remembered obstacle at the shell/front contact point, not at
+        # the robot centre.  When a body-envelope lateral estimate exists, use it;
+        # otherwise use the bumper/contact side estimate.
+        if distance is None or not np.isfinite(float(distance)):
+            d = float(LOW_OBSTACLE_MEMORY_FRONT_M)
+        else:
+            d = float(distance)
+        d = max(float(LOW_OBSTACLE_MEMORY_MIN_FRONT_M), min(float(LOW_OBSTACLE_MEMORY_FRONT_M), d))
+
+        lateral = 0.0
+        if abs(float(obstacle_side)) >= 0.5:
+            lateral = (1.0 if obstacle_side > 0.0 else -1.0) * min(float(CONTACT_SIDE_LATERAL_OFFSET_M), ROBOT_BODY_RADIUS * 0.72)
+            d = max(d, float(CONTACT_SIDE_FORWARD_OFFSET_M))
+        elif abs(float(last_body_corridor_lateral)) > 0.012:
+            lateral = max(-ROBOT_BODY_RADIUS * 0.72, min(ROBOT_BODY_RADIUS * 0.72, float(last_body_corridor_lateral)))
+
+        wx = pose_x + math.cos(pose_theta) * d - math.sin(pose_theta) * lateral
+        wy = pose_y + math.sin(pose_theta) * d + math.cos(pose_theta) * lateral
+        mx, my = world_to_map(wx, wy)
+        if not map_inside(mx, my):
+            last_low_obstacle_memory_debug = "lowObs=outside"
+            return False
+
+        r = max(1, int(round(float(LOW_OBSTACLE_MEMORY_RADIUS_M) * MAP_SCALE)))
+        sr = max(1, int(round(float(LOW_OBSTACLE_MEMORY_SUPPORT_RADIUS_M) * MAP_SCALE)))
+        cv2.circle(hypothesis_obstacle_log_odds, (int(mx), int(my)), r, float(LOW_OBSTACLE_MEMORY_UPDATE), -1)
+        hypothesis_obstacle_log_odds[:, :] = np.minimum(hypothesis_obstacle_log_odds, float(OBSTACLE_HYPOTHESIS_MAX))
+        cv2.circle(log_odds, (int(mx), int(my)), sr, float(LOW_OBSTACLE_MEMORY_LO_UPDATE), -1)
+        cv2.circle(visual_log_odds, (int(mx), int(my)), sr, float(CV_VISUAL_UPDATE) * 0.9, -1)
+        cv2.circle(thin_obstacle_log_odds, (int(mx), int(my)), sr, float(LOW_OBSTACLE_MEMORY_THIN_UPDATE), -1)
+        hypothesis_obstacle_cache_step = -999999
+        last_low_obstacle_memory_time = now
+        try:
+            invalidate_heavy_map_caches("low obstacle memory")
+        except Exception:
+            pass
+        last_low_obstacle_memory_debug = f"lowObs=mark ({int(mx)},{int(my)}) r={r} {str(reason)[:20]}"
+        last_near_collision_hypothesis_debug = last_low_obstacle_memory_debug.replace("lowObs", "nearHyp", 1)
+        return True
+    except Exception as exc:
+        last_low_obstacle_memory_debug = f"lowObs=err {type(exc).__name__}"
+        return False
+
+
+def mark_contact_or_low_obstacle(obstacle_side=0.0, distance=None, reason="contact-like obstacle", force_low=False):
+    """Write physical contact when possible; otherwise write low-object memory."""
+    try:
+        marked = mark_contact_obstacle(obstacle_side, distance if distance is not None else 0.20)
+    except Exception:
+        marked = False
+    if marked:
+        # A one-pixel contact dot is too weak for a small low object.  Reinforce
+        # planning layers without pretending this additional area is bumper data.
+        mark_low_obstacle_memory(obstacle_side, distance, reason="contact support", force=True)
+        return True
+    return mark_low_obstacle_memory(obstacle_side, distance, reason=reason, force=force_low)
 
 def maybe_mark_near_collision_hypothesis(reason="unsafe stop"):
     """Turn repeated non-contact body/front blocking into a temporary map hypothesis."""
@@ -13045,7 +13125,7 @@ def start_edge_trap_escape(obstacle_side, left_dist, right_dist, reason):
     else:
         # obstacle_side +1 means contact/risk on robot left => escape right (-1).
         escape_side = -1.0 if obstacle_side > 0.0 else 1.0
-    mark_contact_obstacle(obstacle_side if obstacle_side != 0.0 else escape_side, min(left_dist, right_dist, BODY_CORRIDOR_PASS_CLEARANCE))
+    mark_contact_or_low_obstacle(obstacle_side if obstacle_side != 0.0 else escape_side, min(left_dist, right_dist, BODY_CORRIDOR_PASS_CLEARANCE))
     nav_action_queue = []
     row_end_candidate_count = 0
     last_contact_trap_time = now
@@ -13241,7 +13321,7 @@ def maybe_handle_sensor_stall(front, center, left, right, body_clearance):
     if obstacle_side == 0.0:
         obstacle_side = 1.0 if last_body_corridor_lateral > 0.0 else -1.0
     escape_side = -obstacle_side if obstacle_side != 0.0 else choose_coverage_side(left, right)
-    mark_contact_obstacle(obstacle_side, min(front, center, BODY_CORRIDOR_PASS_CLEARANCE))
+    mark_contact_or_low_obstacle(obstacle_side, min(front, center, BODY_CORRIDOR_PASS_CLEARANCE))
     start_leg_escape(escape_side, f"sensor-stall proximity recovery d={depth_delta:.2f} rgb={rgb_delta:.1f}", strong=True)
     last_sensor_stall_reason = "hidden contact near furniture"
     last_sensor_stall_time = now
@@ -13641,7 +13721,7 @@ def maybe_handle_under_surface_side_risk(front, center, left, right, body_cleara
         return False
 
     side_dist = left if side > 0.0 else right
-    mark_contact_obstacle(side, min(side_dist, body_clearance, BODY_CORRIDOR_PASS_CLEARANCE))
+    mark_contact_or_low_obstacle(side, min(side_dist, body_clearance, BODY_CORRIDOR_PASS_CLEARANCE))
     last_side_risk_escape_time = now
     start_leg_escape(-side, f"side-risk under-surface side={'L' if side > 0 else 'R'} L={left:.2f} R={right:.2f} body={body_clearance:.2f}@{last_body_corridor_lateral:.2f}", strong=True)
     return True
@@ -13694,7 +13774,7 @@ def maybe_handle_odometry_stall(front, center, left, right, body_clearance):
     obstacle_side = contact_obstacle_side_from_sensors(left, right)
     if obstacle_side == 0.0:
         obstacle_side = 1.0 if last_body_corridor_lateral > 0.0 else -1.0
-    mark_contact_obstacle(obstacle_side, min(front, center, body_clearance, BODY_CORRIDOR_PASS_CLEARANCE))
+    mark_contact_or_low_obstacle(obstacle_side, min(front, center, body_clearance, BODY_CORRIDOR_PASS_CLEARANCE))
     start_leg_escape(-obstacle_side, f"odometry-stall hidden contact moved={moved:.3f} L={left:.2f} R={right:.2f} body={body_clearance:.2f}", strong=True)
     last_sensor_stall_reason = "odometry stall near furniture"
     last_motion_stall_time = now
@@ -15513,7 +15593,7 @@ def simple_sweep_fsm_speeds(front, center, upper_front, left, right, body_cleara
         obstacle_side = contact_obstacle_side_from_bumpers(bumper_left, bumper_right, left, right)
         marked_contact = False
         if nav_state in (NAV_FORWARD, NAV_LANE_SHIFT) or simple_sweep_state in ("MOVE_STRAIGHT", "LANE_SHIFT_STRAIGHT"):
-            marked_contact = mark_contact_obstacle(obstacle_side, min(front, center, BODY_CORRIDOR_PASS_CLEARANCE))
+            marked_contact = mark_contact_or_low_obstacle(obstacle_side, min(front, center, BODY_CORRIDOR_PASS_CLEARANCE))
         if marked_contact:
             update_structural_obstacle_memory()
             update_furniture_zone_cache(force=True)
@@ -15985,7 +16065,7 @@ def physical_bumper_contact_speeds(now, front, center, upper_front, left, right,
         hard_stop_motors()
     obstacle_side = contact_obstacle_side_from_bumpers(bumper_left, bumper_right, left, right)
     side = choose_contact_escape_side(bumper_left, bumper_right, left, right, obstacle_side)
-    mark_contact_obstacle(obstacle_side, min(front, center, BODY_CORRIDOR_PASS_CLEARANCE))
+    mark_contact_or_low_obstacle(obstacle_side, min(front, center, BODY_CORRIDOR_PASS_CLEARANCE))
 
     if EXPLORE_BUMPER_FIRST_MAPPING and matrix_first_explore_active():
         map_side, map_reason = choose_explore_contact_turn_side(bumper_left, bumper_right, left, right)
@@ -16118,8 +16198,8 @@ def choose_motion_from_depth(depth):
     # a contact-like trap before continuing old coverage/under-furniture logic.
     if (
         LOW_OBSTACLE_GUARD_ENABLED
-        and not (EXPLORE_BUMPER_FIRST_MAPPING and matrix_first_explore_active())
-        and nav_state == NAV_FORWARD
+        and (LOW_OBSTACLE_GUARD_MAP_BUILDING_ENABLED or not (EXPLORE_BUMPER_FIRST_MAPPING and matrix_first_explore_active()))
+        and nav_state in (NAV_FORWARD, NAV_GRID_REALIGN)
         and now - last_low_obstacle_guard_time > LOW_OBSTACLE_GUARD_COOLDOWN_SEC
         and not last_floor_front_ignore
         and not cv_front_is_probably_floor_shadow
@@ -16138,12 +16218,31 @@ def choose_motion_from_depth(depth):
             last_low_obstacle_guard_time = now
             obstacle_side = contact_obstacle_side_from_sensors(left, right)
             side = choose_contact_escape_side(False, False, left, right, obstacle_side)
-            mark_contact_obstacle(obstacle_side, min(front, center, BODY_CORRIDOR_PASS_CLEARANCE))
-            start_leg_escape(
-                side,
-                f"precontact low-object guard F={front:.2f} C={center:.2f} U={upper_front:.2f} body={body_clearance:.2f}",
-                strong=True,
+            mark_contact_or_low_obstacle(
+                obstacle_side,
+                min(front, center, body_clearance, BODY_CORRIDOR_PASS_CLEARANCE),
+                reason="precontact low object",
+                force_low=True,
             )
+            if nav_state == NAV_GRID_REALIGN:
+                start_contact_recovery(
+                    side,
+                    "front" if abs(obstacle_side) < 0.5 else "side",
+                    f"grid-realign low-object block F={front:.2f} C={center:.2f} U={upper_front:.2f} body={body_clearance:.2f}",
+                    FRONT_CONTACT_TRAP_BACKUP_DISTANCE,
+                    FRONT_CONTACT_TRAP_BACKUP_TIMEOUT_SEC,
+                    FRONT_CONTACT_TRAP_TURN_ANGLE,
+                    FRONT_CONTACT_TRAP_FORWARD_DISTANCE,
+                    CONTACT_ESCAPE_VERIFY_SPEED,
+                    FRONT_CONTACT_TRAP_FORWARD_TIMEOUT_SEC,
+                    True,
+                )
+            else:
+                start_leg_escape(
+                    side,
+                    f"precontact low-object guard F={front:.2f} C={center:.2f} U={upper_front:.2f} body={body_clearance:.2f}",
+                    strong=True,
+                )
             return 0.0, 0.0
 
     post_recovery_cmd = post_recovery_stabilizer_speeds(front, center, upper_front, left, right, body_clearance)
@@ -16352,7 +16451,7 @@ def choose_motion_from_depth(depth):
         if bumper_left or bumper_right:
             side = -1.0 if bumper_left and not bumper_right else (1.0 if bumper_right and not bumper_left else leg_escape_side)
             obstacle_side = contact_obstacle_side_from_bumpers(bumper_left, bumper_right, left, right)
-            mark_contact_obstacle(obstacle_side, min(front, center, BODY_CORRIDOR_PASS_CLEARANCE))
+            mark_contact_or_low_obstacle(obstacle_side, min(front, center, BODY_CORRIDOR_PASS_CLEARANCE))
             start_contact_recovery(
                 side,
                 "front" if last_bumper_center or (bumper_left and bumper_right) else "side",
@@ -16382,7 +16481,7 @@ def choose_motion_from_depth(depth):
         if bumper_left or bumper_right:
             side = -1.0 if bumper_left and not bumper_right else (1.0 if bumper_right and not bumper_left else leg_escape_side)
             obstacle_side = contact_obstacle_side_from_bumpers(bumper_left, bumper_right, left, right)
-            mark_contact_obstacle(obstacle_side, min(front, center, BODY_CORRIDOR_PASS_CLEARANCE))
+            mark_contact_or_low_obstacle(obstacle_side, min(front, center, BODY_CORRIDOR_PASS_CLEARANCE))
             start_contact_recovery(
                 side,
                 "front" if last_bumper_center or (bumper_left and bumper_right) else "side",
@@ -16398,7 +16497,7 @@ def choose_motion_from_depth(depth):
             return 0.0, 0.0
         if (center < LOW_OBSTACLE_GUARD_CENTER_M and front < LOW_OBSTACLE_GUARD_FRONT_M) or body_clearance < LOW_OBSTACLE_GUARD_BODY_M:
             side = choose_contact_escape_side(False, False, left, right, contact_obstacle_side_from_sensors(left, right))
-            mark_contact_obstacle(0.0, min(front, center, BODY_CORRIDOR_PASS_CLEARANCE))
+            mark_contact_or_low_obstacle(0.0, min(front, center, BODY_CORRIDOR_PASS_CLEARANCE))
             start_leg_escape(side, f"escape-forward low block F={front:.2f} C={center:.2f} body={body_clearance:.2f}", strong=True)
             return 0.0, 0.0
         moved = math.hypot(pose_x - leg_escape_forward_start_x, pose_y - leg_escape_forward_start_y)
@@ -16432,7 +16531,7 @@ def choose_motion_from_depth(depth):
         if bumper_left or bumper_right:
             side = -1.0 if bumper_left and not bumper_right else (1.0 if bumper_right and not bumper_left else leg_pass_side)
             obstacle_side = contact_obstacle_side_from_bumpers(bumper_left, bumper_right, left, right)
-            mark_contact_obstacle(obstacle_side, min(front, center, BODY_CORRIDOR_PASS_CLEARANCE))
+            mark_contact_or_low_obstacle(obstacle_side, min(front, center, BODY_CORRIDOR_PASS_CLEARANCE))
             start_leg_escape(side, f"leg pass contact L={int(bumper_left)} R={int(bumper_right)} F={front:.2f}", strong=True)
             return 0.0, 0.0
         squeeze_cmd = narrow_passage_centering_speeds(front, center, upper_front, left, right, body_clearance)
@@ -16801,7 +16900,7 @@ def choose_motion_from_depth(depth):
         if bumper_left or bumper_right:
             side = -1.0 if bumper_left and not bumper_right else (1.0 if bumper_right and not bumper_left else choose_coverage_side(left, right))
             obstacle_side = contact_obstacle_side_from_bumpers(bumper_left, bumper_right, left, right)
-            mark_contact_obstacle(obstacle_side, min(front, center, BODY_CORRIDOR_PASS_CLEARANCE))
+            mark_contact_or_low_obstacle(obstacle_side, min(front, center, BODY_CORRIDOR_PASS_CLEARANCE))
             start_leg_escape(side, f"under-furniture contact L={int(bumper_left)} C={int(last_bumper_center)} R={int(bumper_right)}", strong=True)
             return 0.0, 0.0
         obstacle_side = contact_obstacle_side_from_sensors(left, right)
@@ -16814,7 +16913,7 @@ def choose_motion_from_depth(depth):
             return 0.0, 0.0
         if front < ROW_END_HARD_DISTANCE and center < SAFE_FRONT_DISTANCE:
             side = choose_contact_escape_side(False, False, left, right, contact_obstacle_side_from_sensors(left, right))
-            mark_contact_obstacle(0.0, min(front, center, BODY_CORRIDOR_PASS_CLEARANCE))
+            mark_contact_or_low_obstacle(0.0, min(front, center, BODY_CORRIDOR_PASS_CLEARANCE))
             start_leg_escape(side, f"under-furniture hard block F={front:.2f} C={center:.2f}", strong=True)
             return 0.0, 0.0
         # A low obstacle can be below the most stable upper-depth band while the
@@ -16822,7 +16921,7 @@ def choose_motion_from_depth(depth):
         # permission to keep pushing under the shelf.
         if (center < LOW_OBSTACLE_GUARD_CENTER_M and front < LOW_OBSTACLE_GUARD_FRONT_M) or body_clearance < LOW_OBSTACLE_GUARD_BODY_M:
             side = choose_contact_escape_side(False, False, left, right, contact_obstacle_side_from_sensors(left, right))
-            mark_contact_obstacle(0.0, min(front, center, BODY_CORRIDOR_PASS_CLEARANCE))
+            mark_contact_or_low_obstacle(0.0, min(front, center, BODY_CORRIDOR_PASS_CLEARANCE))
             start_leg_escape(side, f"under-furniture low/body block F={front:.2f} C={center:.2f} U={upper_front:.2f} body={body_clearance:.2f}", strong=True)
             return 0.0, 0.0
 
@@ -17958,6 +18057,7 @@ def save_map():
 def reset_map():
     global log_odds, visual_log_odds, thin_obstacle_log_odds, contact_log_odds, structural_log_odds, under_surface_log_odds, hypothesis_obstacle_log_odds
     global hypothesis_obstacle_cache, hypothesis_obstacle_cache_step, last_hypothesis_obstacle_debug, last_near_collision_hypothesis_time, last_near_collision_hypothesis_debug
+    global last_low_obstacle_memory_time, last_low_obstacle_memory_debug
     global trajectory, cleaned_mask, recent_visit_log_odds, row_start_x, row_start_y, row_start_time
     global coverage_goal_map, coverage_goal_world, coverage_goal_kind, last_contact_map_cells, last_under_surface_cells, last_under_surface_target_cells
     global last_bumper_any_raw_active, last_contact_latch_time, last_contact_latch_used
@@ -18018,6 +18118,8 @@ def reset_map():
     last_hypothesis_obstacle_debug = "hypObs=reset"
     last_near_collision_hypothesis_time = -999.0
     last_near_collision_hypothesis_debug = "nearHyp=reset"
+    last_low_obstacle_memory_time = -999.0
+    last_low_obstacle_memory_debug = "lowObs=reset"
     last_contact_map_cells = 0
     last_bumper_any_raw_active = False
     last_contact_latch_time = -999.0
