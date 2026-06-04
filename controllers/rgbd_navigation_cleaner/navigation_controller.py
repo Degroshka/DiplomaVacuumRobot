@@ -18,6 +18,7 @@ from pathlib import Path
 import math
 import time
 import heapq
+import itertools
 
 from mapping import (
     bresenham_cells as _bresenham_cells,
@@ -506,10 +507,12 @@ last_commit_type_debug = "commitType=none"
 last_objective_noise_filter_debug = "noise off"
 last_raw_map_speckle_debug = "rawNoise=idle"
 last_furniture_zone_debug = "furnitureZone=init"
+last_leg_quad_debug = "legQuad=init"
 last_planning_layer_debug = "planningMap=init"
 furniture_zone_core_cache = None
 furniture_zone_inflated_cache = None
 furniture_zone_cache_step = -999999
+leg_quad_last_step = -999999
 last_perf_debug = "perf startup"
 last_perf_loop_ms = 0.0
 last_planner_update_step = -999999
@@ -1044,6 +1047,7 @@ def mapping_update_cadences():
         "under": effective_under_update_steps(),
         "struct": effective_structural_update_steps(),
         "noise": effective_planner_update_steps(max(1, int(RAW_MAP_SPECKLE_CLEANUP_STEPS))),
+        "legquad": effective_planner_update_steps(max(1, int(FURNITURE_LEG_QUAD_UPDATE_STEPS))),
     }
 
 
@@ -1076,6 +1080,9 @@ def run_mapping_stage(pose, frame, depth):
 
     if STRUCTURAL_OBSTACLE_MEMORY_ENABLED and task_due(cadence["struct"]):
         profiled_call("struct", update_structural_obstacle_memory)
+
+    if FURNITURE_LEG_QUAD_ENABLED and task_due(cadence["legquad"]):
+        profiled_call("legquad", update_leg_quad_fitting)
 
     if RAW_MAP_SPECKLE_CLEANUP_ENABLED and task_due(cadence["noise"]):
         profiled_call("noise", cleanup_raw_map_speckles)
@@ -1329,7 +1336,7 @@ def compact_debug_status_line():
         f"frontier={last_frontier_cells} {last_gray_gap_debug[:26]} {last_exploration_cleanup_lock_debug[:34]} "
         f"{runtime_arena_guard_debug[:24]} {odom_arena_clamp_debug[:22]} {frontier_route_abort_hold_debug[:24]} "
         f"{last_hypothesis_obstacle_debug[:28]} {last_near_collision_hypothesis_debug[:22]} {last_low_obstacle_memory_debug[:22]} "
-        f"plan={last_planning_layer_debug[:34]} "
+        f"{last_leg_quad_debug[:32]} plan={last_planning_layer_debug[:34]} "
         f"scan={last_active_scan_debug[:28]} gate={last_frontier_only_gate_debug[:30]} occ={last_rgbd_occlusion_debug[:18]} {last_debug_viewer_status[:22]} {last_render_throttle_debug[:18]} {load_shedding_debug_text()[:24]} {metrics_last_debug[:22]} {last_dock_stall_debug[:24]} {last_wall_trap_debug[:26]}"
     )
 
@@ -1350,6 +1357,7 @@ def verbose_debug_status_line():
         f"scan={last_active_scan_debug}, gate={last_frontier_only_gate_debug}, "
         f"arena={runtime_arena_guard_debug}, odom={odom_arena_clamp_debug}, hold={frontier_route_abort_hold_debug}, "
         f"hyp={last_hypothesis_obstacle_debug}, near={last_near_collision_hypothesis_debug}, low={last_low_obstacle_memory_debug}, "
+        f"legQuad={last_leg_quad_debug}, "
         f"occ={last_rgbd_occlusion_debug}, {last_debug_viewer_status}, {last_render_throttle_debug}, {load_shedding_debug_text()}, {last_perf_debug}"
     )
 
@@ -4381,6 +4389,191 @@ def update_furniture_zone_cache(force=False):
 
 def furniture_zone_masks():
     return update_furniture_zone_cache(force=False)
+
+
+# ---------------------------------------------------------------------------
+# Leg-quad structural fitting
+# ---------------------------------------------------------------------------
+
+def _cluster_leg_pts(pts, max_dist_px):
+    """BFS single-linkage clustering of map-pixel (x, y) points."""
+    n = len(pts)
+    visited = [False] * n
+    groups = []
+    max_d2 = max_dist_px * max_dist_px
+    for start in range(n):
+        if visited[start]:
+            continue
+        group = [start]
+        visited[start] = True
+        queue = [start]
+        while queue:
+            cur = queue.pop()
+            cx, cy = pts[cur]
+            for j in range(n):
+                if not visited[j]:
+                    dx = cx - pts[j][0]
+                    dy = cy - pts[j][1]
+                    if dx * dx + dy * dy <= max_d2:
+                        visited[j] = True
+                        group.append(j)
+                        queue.append(j)
+        groups.append([pts[k] for k in group])
+    return groups
+
+
+def _fit_axis_aligned_rect_to_legs(pts_list):
+    """Fit an axis-aligned rectangle to 2-4 leg centroid positions.
+
+    Tries all subsets of size 4, 3, 2 (largest first) and returns the best
+    axis-aligned bounding rectangle whose sides satisfy the span limits.
+
+    Returns (corners_4x2_float32, quality) or (None, 0.0).
+    corners order: [TL, TR, BL, BR].
+    quality ∈ [0, 1]; 1 = all observed points exactly at corners.
+    """
+    pts = np.array(pts_list[:8], dtype=np.float32)
+    n = len(pts)
+    if n < 2:
+        return None, 0.0
+
+    min_span = float(FURNITURE_LEG_QUAD_MIN_SPAN_M) * float(MAP_SCALE)
+    max_span = float(FURNITURE_LEG_QUAD_MAX_SPAN_M) * float(MAP_SCALE)
+    snap_tol_frac = float(FURNITURE_LEG_QUAD_SNAP_TOL_FRAC)
+
+    best_corners = None
+    best_quality = 0.0
+
+    for k in range(min(n, 4), 1, -1):
+        for subset_idx in itertools.combinations(range(n), k):
+            sub = pts[list(subset_idx)]
+            xl = float(sub[:, 0].min())
+            xr = float(sub[:, 0].max())
+            yt = float(sub[:, 1].min())
+            yb = float(sub[:, 1].max())
+            dx = xr - xl
+            dy = yb - yt
+            if dx < min_span or dy < min_span:
+                continue
+            if dx > max_span or dy > max_span:
+                continue
+            # For 2-point diagonal require meaningful span on both axes.
+            if k == 2 and (dx < min_span * 1.4 or dy < min_span * 1.4):
+                continue
+            corners = np.array(
+                [[xl, yt], [xr, yt], [xl, yb], [xr, yb]], dtype=np.float32
+            )
+            snap_tol = max(dx, dy) * snap_tol_frac
+            q = 0.0
+            for p in sub:
+                d = float(np.linalg.norm(corners - p, axis=1).min())
+                q += max(0.0, 1.0 - d / max(1.0, snap_tol))
+            q /= k
+            if q > best_quality:
+                best_quality = q
+                best_corners = corners
+        if best_quality >= float(FURNITURE_LEG_QUAD_MIN_QUALITY):
+            break  # found a sufficient fit at this subset size
+
+    return best_corners, best_quality
+
+
+def _stamp_leg_quad(corners_px):
+    """Boost structural_log_odds at the 4 fitted rectangle corners."""
+    r_px = max(1, int(round(float(FURNITURE_LEG_QUAD_FILL_RADIUS_M) * float(MAP_SCALE))))
+    score = float(FURNITURE_LEG_QUAD_PROMOTE_SCORE)
+    smax = float(STRUCTURAL_MAX)
+    count = 0
+    for corner in corners_px:
+        cmx = int(round(float(corner[0])))
+        cmy = int(round(float(corner[1])))
+        for dy in range(-r_px, r_px + 1):
+            for dx in range(-r_px, r_px + 1):
+                if dx * dx + dy * dy <= r_px * r_px:
+                    px, py = cmx + dx, cmy + dy
+                    if map_inside(px, py):
+                        structural_log_odds[py, px] = min(
+                            smax, structural_log_odds[py, px] + score
+                        )
+                        count += 1
+    return count
+
+
+def update_leg_quad_fitting():
+    """Detect individual leg clusters, fit axis-aligned rectangles, stamp missing legs.
+
+    Finds small compact obstacle clusters (individual furniture legs), groups them
+    spatially, attempts to fit a rectangle to each group, then promotes the 4
+    inferred corner positions into structural_log_odds.  Requires at least
+    FURNITURE_LEG_QUAD_MIN_LEGS real detected clusters before snapping anything.
+    """
+    global structural_log_odds, leg_quad_last_step, last_leg_quad_debug
+    if not FURNITURE_LEG_QUAD_ENABLED:
+        last_leg_quad_debug = "legQuad=off"
+        return 0
+    if not STRUCTURAL_OBSTACLE_MEMORY_ENABLED:
+        last_leg_quad_debug = "legQuad=noStruct"
+        return 0
+    if int(step_id) - int(leg_quad_last_step) < int(FURNITURE_LEG_QUAD_UPDATE_STEPS):
+        return 0
+    leg_quad_last_step = int(step_id)
+    try:
+        obs = base_physical_obstacle_mask().astype(np.uint8)
+        # Remove isolated single-pixel noise while preserving small leg clusters.
+        obs = cv2.morphologyEx(obs, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+
+        wall = arena_wall_touch_mask()
+        n_comp, labels, stats, centroids_arr = cv2.connectedComponentsWithStats(obs, 8)
+
+        min_px = int(FURNITURE_LEG_QUAD_MIN_LEG_PX)
+        max_px = int(FURNITURE_LEG_QUAD_MAX_LEG_PX)
+        max_asp = float(FURNITURE_LEG_QUAD_LEG_MAX_ASPECT)
+
+        leg_pts = []
+        for cid in range(1, int(n_comp)):
+            area = int(stats[cid, cv2.CC_STAT_AREA])
+            if area < min_px or area > max_px:
+                continue
+            w = int(stats[cid, cv2.CC_STAT_WIDTH])
+            h = int(stats[cid, cv2.CC_STAT_HEIGHT])
+            asp = max(w, h) / max(1, min(w, h))
+            if asp > max_asp:
+                continue
+            lx = int(stats[cid, cv2.CC_STAT_LEFT])
+            ly = int(stats[cid, cv2.CC_STAT_TOP])
+            # Reject border- or wall-touching components.
+            if lx <= 1 or ly <= 1 or lx + w >= MAP_SIZE - 2 or ly + h >= MAP_SIZE - 2:
+                continue
+            comp_mask = labels == cid
+            if np.any(comp_mask & wall):
+                continue
+            leg_pts.append((float(centroids_arr[cid][0]), float(centroids_arr[cid][1])))
+
+        if len(leg_pts) < int(FURNITURE_LEG_QUAD_MIN_LEGS):
+            last_leg_quad_debug = f"legQuad=0 cands={len(leg_pts)}"
+            return 0
+
+        max_dist_px = float(FURNITURE_LEG_QUAD_MAX_SPAN_M) * float(MAP_SCALE)
+        groups = _cluster_leg_pts(leg_pts, max_dist_px)
+
+        total_stamps = 0
+        groups_fitted = 0
+        for group in groups:
+            if len(group) < int(FURNITURE_LEG_QUAD_MIN_LEGS):
+                continue
+            corners, quality = _fit_axis_aligned_rect_to_legs(group)
+            if corners is None or quality < float(FURNITURE_LEG_QUAD_MIN_QUALITY):
+                continue
+            groups_fitted += 1
+            total_stamps += _stamp_leg_quad(corners)
+
+        last_leg_quad_debug = (
+            f"legQuad={groups_fitted} c={len(leg_pts)} g={len(groups)} s={total_stamps}"
+        )
+        return total_stamps
+    except Exception as exc:
+        last_leg_quad_debug = f"legQuad=err {type(exc).__name__}"
+        return 0
 
 
 def _hypothesis_clear_on_free_observations():
@@ -10339,9 +10532,10 @@ def learned_map_ready_to_clean():
     mapping; the second learned-map K pass will clean systematically from dock.
     """
     global auto_map_ready_best_coverage, auto_map_ready_best_time, auto_map_ready_debug
-    if not AUTO_LEARNED_MAP_CLEANING_ENABLED:
-        auto_map_ready_debug = "autoMap=off"
-        return False, auto_map_ready_debug
+    # Note: this readiness gate stays active even in map-only mode
+    # (AUTO_LEARNED_MAP_CLEANING_ENABLED False) so the robot still returns to the
+    # dock when the map is complete; the dock arrival then stops instead of
+    # starting the K cleaning phase (see complete_map_return_to_dock).
     if auto_map_cleaning_started or auto_map_return_to_dock_active or dock_return_active or dock_return_completed:
         auto_map_ready_debug = f"autoMap=busy phase={auto_map_mission_phase} dock={dock_return_status[:26]}"
         return False, auto_map_ready_debug
@@ -10598,9 +10792,28 @@ def enable_learned_map_coverage_cleaning(reason="returned to dock"):
 
 
 def complete_map_return_to_dock(reason="map locked at dock"):
-    """Complete the intermediate dock stop and immediately switch to K cleaning."""
+    """Finish the dock return.  In map-only mode stop here; otherwise start K cleaning."""
     global dock_return_active, dock_return_completed, dock_return_status, dock_return_reason, coverage_status
+    global auto_map_return_to_dock_active, auto_map_mission_phase, planner_mode, planner_intent
     dock_return_active = False
+    if not AUTO_LEARNED_MAP_CLEANING_ENABLED:
+        # Map-only mission: park at the dock and stop.  Do not build coverage
+        # routes or start the learned-map cleaning phase.
+        dock_return_completed = True
+        auto_map_return_to_dock_active = False
+        auto_map_mission_phase = "MAP_ONLY_DONE"
+        planner_mode = "MAP_ONLY_DOCKED"
+        planner_intent = PLANNER_INTENT_FINISH_CLEANUP
+        dock_return_reason = str(reason or "map dock reached")
+        dock_return_status = f"map-only mission complete, parked at dock: {dock_return_reason[:28]}"
+        coverage_status = dock_return_status
+        hard_stop_motors()
+        try:
+            acquire_control(ControlOwner.PLANNER, DOCK_STOP_HOLD_OWNER_SEC, 0.0, "map-only docked stop")
+        except Exception:
+            pass
+        print("[MISSION] map-only complete:", dock_return_status)
+        return True
     dock_return_completed = False
     dock_return_reason = str(reason or "map dock reached")
     dock_return_status = f"dock reached for learned K: {dock_return_reason[:38]}"
@@ -10614,8 +10827,6 @@ def start_map_complete_return_to_dock(reason="learned map ready"):
     global auto_map_mission_phase, auto_map_return_to_dock_active, auto_map_ready_debug
     global simple_sweep_completed, simple_sweep_completion_reason, simple_sweep_last_debug
     global coverage_status, planner_mode, planner_intent, planner_intent_reason
-    if not AUTO_LEARNED_MAP_CLEANING_ENABLED:
-        return False
     if auto_map_cleaning_started or auto_map_return_to_dock_active or dock_return_active or dock_return_completed:
         return False
     auto_map_mission_phase = "RETURN_TO_DOCK_FOR_K"
@@ -15808,6 +16019,7 @@ def simple_sweep_fsm_speeds(front, center, upper_front, left, right, body_cleara
         if marked_contact:
             update_structural_obstacle_memory()
             update_furniture_zone_cache(force=True)
+            update_leg_quad_fitting()
         if nav_state == NAV_FORWARD and simple_sweep_state == "MOVE_STRAIGHT":
             row_end_candidate_count = 0
             is_row_end, contact_kind = simple_sweep_contact_is_row_end(

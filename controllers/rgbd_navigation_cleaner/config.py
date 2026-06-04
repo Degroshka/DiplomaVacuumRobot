@@ -719,6 +719,31 @@ FURNITURE_ZONE_COLOR = (210, 70, 230)
 FURNITURE_ZONE_INFLATED_COLOR = (170, 120, 190)
 FURNITURE_ZONE_DRAW_OVERLAY = False
 FURNITURE_ZONE_DRAW_LABELS = False
+# Structural leg-quad fitting: detect small leg clusters, fit rectangles, snap
+# missing legs into structural_log_odds for robust furniture footprints.
+# Requires STRUCTURAL_OBSTACLE_MEMORY_ENABLED and FURNITURE_ZONE_DETECTION_ENABLED.
+FURNITURE_LEG_QUAD_ENABLED = True
+# Steps between full re-fits (25 ≈ 1.6 s at 64 ms timestep).
+FURNITURE_LEG_QUAD_UPDATE_STEPS = 25
+# Minimum detected leg candidates to attempt fitting.
+FURNITURE_LEG_QUAD_MIN_LEGS = 2
+# Connected-component size window for individual leg clusters (px).
+FURNITURE_LEG_QUAD_MIN_LEG_PX = 3
+FURNITURE_LEG_QUAD_MAX_LEG_PX = 90
+# Max aspect ratio of a leg bounding box (legs are compact, not elongated).
+FURNITURE_LEG_QUAD_LEG_MAX_ASPECT = 3.5
+# Spatial grouping distance – legs of the same piece of furniture.
+FURNITURE_LEG_QUAD_MAX_SPAN_M = 1.55
+# Minimum rectangle side to accept (filters out point-cloud noise pairs).
+FURNITURE_LEG_QUAD_MIN_SPAN_M = 0.28
+# Snap tolerance expressed as a fraction of the longer bounding-box side.
+FURNITURE_LEG_QUAD_SNAP_TOL_FRAC = 0.32
+# Minimum fit quality [0, 1] required to stamp missing corners.
+FURNITURE_LEG_QUAD_MIN_QUALITY = 0.54
+# Radius of the disc stamped at each fitted corner (metres).
+FURNITURE_LEG_QUAD_FILL_RADIUS_M = 0.055
+# Log-odds added to structural_log_odds at each stamped corner cell.
+FURNITURE_LEG_QUAD_PROMOTE_SCORE = 3.5
 PLANNING_LAYER_ENABLED = True
 PLANNING_CENTER_NO_GO_USES_FURNITURE_INFLATION = True
 PLANNING_CENTER_NO_GO_CLOSE_GAPS_M = 0.020
@@ -1180,7 +1205,10 @@ WALL_TRAP_FRONTIER_ACTION_COOLDOWN_SEC = 8.0
 WALL_TRAP_FRONTIER_BLACKLIST_RADIUS_M = 0.55
 WALL_TRAP_FRONTIER_BLACKLIST_SEC = 120.0
 DOCK_STOP_HOLD_OWNER_SEC = 9999.0
-AUTO_LEARNED_MAP_CLEANING_ENABLED = True
+# Map-only mission: when False the robot still explores and returns to the dock,
+# but it STOPS there instead of starting the learned-map K cleaning / coverage
+# route phase.  Set False to focus purely on building the map.
+AUTO_LEARNED_MAP_CLEANING_ENABLED = False
 AUTO_MAP_COMPLETE_MIN_TIME_SEC = 118.0
 AUTO_MAP_COMPLETE_MIN_COVERAGE_PERCENT = 47.0
 AUTO_MAP_COMPLETE_STRONG_COVERAGE_PERCENT = 54.0
