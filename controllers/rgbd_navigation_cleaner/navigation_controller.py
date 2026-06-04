@@ -527,6 +527,8 @@ frontier_only_last_blacklist_time = -999.0
 frontier_only_last_stall_debug = "stall=idle"
 frontier_only_stall_best_cov = -1.0
 frontier_only_stall_best_cov_time = -999.0
+last_obs_boundary_cells = 0
+last_obs_boundary_debug = "obsBoundary=init"
 frontier_direct_last_unsafe_recovery_at = -999.0
 frontier_direct_last_unsafe_recovery_debug = "unsafeRecovery=idle"
 post_turn_rgbd_snapshot_until = -999.0
@@ -6306,6 +6308,65 @@ def build_frontier_revisit_mask(unknown, cleanable, obstacles):
             return np.zeros_like(unknown, dtype=np.bool_)
 
 
+def build_obs_boundary_vantage_mask(obstacles, cleanable, unknown):
+    """Return cleanable cells just outside obstacle clusters that have unexplored sides.
+
+    These vantage positions give the robot line-of-sight to gray (unknown) cells
+    adjacent to obstacles — the unseen faces that never become regular frontiers
+    because the shadow-rejection filter correctly removes them from the gray-gap
+    set.  Reaching a vantage point triggers an RGBD capture that fills in the
+    obstacle silhouette without relying on accidental close passes.
+    """
+    global last_obs_boundary_cells, last_obs_boundary_debug
+    if not OBS_BOUNDARY_FRONTIER_ENABLED:
+        last_obs_boundary_debug = "obsBoundary=off"
+        last_obs_boundary_cells = 0
+        return np.zeros_like(cleanable, dtype=np.bool_)
+    try:
+        # Use stable confirmed obstacles only to avoid chasing sensor noise.
+        obs_stable = obstacles & (log_odds > float(LO_OCCUPIED_EPS) + 0.5)
+        if not np.any(obs_stable):
+            last_obs_boundary_debug = "obsBoundary=none"
+            last_obs_boundary_cells = 0
+            return np.zeros_like(cleanable, dtype=np.bool_)
+
+        approach_r = max(2, int(round(float(OBS_BOUNDARY_FRONTIER_APPROACH_M) * MAP_SCALE)))
+        k_approach = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * approach_r + 1, 2 * approach_r + 1)
+        )
+        k_adj = np.ones((5, 5), np.uint8)
+
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(
+            obs_stable.astype(np.uint8), 8
+        )
+        vantage = np.zeros_like(cleanable, dtype=np.bool_)
+        total_vantage = 0
+        clusters_used = 0
+
+        for cid in range(1, int(n)):
+            if int(stats[cid, cv2.CC_STAT_AREA]) < int(OBS_BOUNDARY_FRONTIER_MIN_CLUSTER_CELLS):
+                continue
+            comp = (labels == cid)
+            # Count unexplored gray cells directly adjacent to this cluster.
+            adj = cv2.dilate(comp.astype(np.uint8), k_adj, iterations=1) > 0
+            adj_unknown = int(np.count_nonzero(adj & unknown & ~comp))
+            if adj_unknown < int(OBS_BOUNDARY_FRONTIER_MIN_ADJACENT_UNKNOWN):
+                continue
+            # Vantage ring = approach dilation ∩ cleanable ∩ not inside cluster.
+            outer = (cv2.dilate(comp.astype(np.uint8), k_approach, iterations=1) > 0) & cleanable & ~comp
+            vantage |= outer
+            total_vantage += int(np.count_nonzero(outer))
+            clusters_used += 1
+
+        last_obs_boundary_cells = total_vantage
+        last_obs_boundary_debug = f"obsBoundary={total_vantage} clusters={clusters_used}"
+        return vantage.astype(np.bool_)
+    except Exception as exc:
+        last_obs_boundary_debug = f"obsBoundary=err {type(exc).__name__}"
+        last_obs_boundary_cells = 0
+        return np.zeros_like(cleanable, dtype=np.bool_)
+
+
 def compute_coverage_masks():
     """Build a cleanable/covered/obstacle view from the persistent map.
 
@@ -8590,6 +8651,8 @@ def plan_best_coverage_route(obstacles, cleanable, cleaned, uncleaned, unknown, 
     frontier_radius_px = max(1, int(EXPLORE_FRONTIER_VANTAGE_RADIUS_M * MAP_SCALE))
     frontier_integral = cv2.integral(frontier.astype(np.uint8))
     unknown_integral = cv2.integral(unknown.astype(np.uint8))
+    obs_boundary = build_obs_boundary_vantage_mask(obstacles, cleanable, unknown)
+    obs_boundary_integral = cv2.integral(obs_boundary.astype(np.uint8))
     frontier_component_labels = np.zeros_like(frontier, dtype=np.int32)
     frontier_component_sizes = np.zeros(1, dtype=np.int32)
     try:
@@ -8665,6 +8728,7 @@ def plan_best_coverage_route(obstacles, cleanable, cleaned, uncleaned, unknown, 
                     if ids.size > 0:
                         frontier_component_cells = int(np.max(frontier_component_sizes[ids]))
             unknown_local_cells = integral_rect_count(unknown_integral, cx, cy, frontier_radius_px)
+            obs_boundary_local = integral_rect_count(obs_boundary_integral, cx, cy, frontier_radius_px)
             coarse_frontier_local_cells[gy, gx] = int(front_local_cells)
             coarse_frontier_component_cells[gy, gx] = int(frontier_component_cells)
             coarse_frontier_unknown_cells[gy, gx] = int(unknown_local_cells)
@@ -8689,6 +8753,12 @@ def plan_best_coverage_route(obstacles, cleanable, cleaned, uncleaned, unknown, 
                     or front_local_cells >= EXPLORE_FRONTIER_VANTAGE_MIN_LOCAL_CELLS
                 )
             )
+            obs_boundary_vantage = bool(
+                explore_priority
+                and OBS_BOUNDARY_FRONTIER_ENABLED
+                and obs_boundary_local >= int(OBS_BOUNDARY_FRONTIER_MIN_LOCAL_CELLS)
+                and float(last_coverage_percent or 0.0) >= float(OBS_BOUNDARY_FRONTIER_MIN_COVERAGE_PERCENT)
+            )
             if frontier_vantage:
                 target_kind[gy, gx] = 2
                 fwd = longitudinal / max(dist, 1e-6)
@@ -8703,6 +8773,13 @@ def plan_best_coverage_route(obstacles, cleanable, cleaned, uncleaned, unknown, 
                     + open_area_bonus
                     + 2.0 * max(0.0, fwd)
                 )
+            elif obs_boundary_vantage:
+                target_kind[gy, gx] = 4
+                obs_bonus = min(
+                    float(OBS_BOUNDARY_FRONTIER_BONUS_MAX),
+                    float(OBS_BOUNDARY_FRONTIER_BONUS_SCALE) * float(obs_boundary_local),
+                )
+                target_reward[gy, gx] = float(OBS_BOUNDARY_FRONTIER_REWARD) + obs_bonus
             elif (not cleanup_locked) and under_ratio >= GLOBAL_ROUTE_TARGET_UNDER_RATIO and dist <= GLOBAL_ROUTE_UNDER_MAX_DIST_M and under_direct:
                 # Keep under-furniture cleanup opportunistic. It may win only when
                 # the robot is already near and lined up with the opening. Without
@@ -9343,7 +9420,7 @@ def plan_best_coverage_route(obstacles, cleanable, cleaned, uncleaned, unknown, 
         wx = (cx - MAP_ORIGIN_X) / MAP_SCALE
         wy = (MAP_ORIGIN_Y - cy) / MAP_SCALE
     wp_map, wp_world = route_waypoint_from_path(route)
-    kind_name = {1: "uncleaned", 2: "frontier", 3: "under-surface"}.get(kind_code, "uncleaned")
+    kind_name = {1: "uncleaned", 2: "frontier", 3: "under-surface", 4: "obs-boundary"}.get(kind_code, "uncleaned")
     route_world = [((mx - MAP_ORIGIN_X) / MAP_SCALE, (MAP_ORIGIN_Y - my) / MAP_SCALE) for mx, my in route]
     last_route_planner_ms = (time.perf_counter() - planner_t0) * 1000.0
     last_route_planner_nodes = int(expanded_nodes)
@@ -9984,6 +10061,11 @@ def finish_route_commit(reason="entry reached"):
         route_abort_reason = "none"
         last_route_commit_debug = dock_return_status
         hard_stop_motors()
+        if AUTO_SAVE_ON_DOCK_RETURN:
+            try:
+                save_run_summary(f"dock_return: {dock_return_reason[:40]}")
+            except Exception:
+                pass
         acquire_control(ControlOwner.PLANNER, DOCK_STOP_HOLD_OWNER_SEC, 0.0, "docked stop")
         return
 
@@ -18115,6 +18197,43 @@ def save_map():
     print("Save is passive: motion owner remains", last_control_owner_debug, auto_map_ready_debug, learned_map_sanitize_debug)
 
 
+def save_run_summary(reason=""):
+    """Save map images + JSON metrics snapshot — called on dock return and sim end."""
+    import json
+    try:
+        ts = int(robot.getTime() * 1000)
+        occ_path = maps_dir / f"occupancy_map_{ts:07d}.png"
+        cv2.imwrite(str(occ_path), render_map(auto_crop=False))
+        cov_path = maps_dir / f"coverage_objective_map_{ts:07d}.png"
+        cv2.imwrite(str(cov_path), render_coverage_planner_map(auto_crop=False))
+        metrics = {
+            "time_s": float(robot.getTime()),
+            "reason": str(reason),
+            "coverage_percent": float(last_coverage_percent or 0.0),
+            "coverage_cells": int(last_coverage_cleaned_cells or 0),
+            "total_cells": int(last_coverage_total_cells or 0),
+            "frontier_cells": int(last_frontier_cells or 0),
+            "gray_gap_cells": int(last_gray_gap_cells or 0),
+            "gray_gap_components": int(last_gray_gap_components or 0),
+            "obs_boundary_cells": int(last_obs_boundary_cells or 0),
+            "navigation_phase": str(navigation_phase),
+            "planner_confidence": str(planner_confidence),
+            "planner_intent": str(planner_intent),
+            "dock_return_completed": bool(dock_return_completed),
+            "map_mature": bool(map_mature),
+        }
+        metrics_path = maps_dir / f"run_metrics_{ts:07d}.json"
+        with open(str(metrics_path), "w") as f:
+            json.dump(metrics, f, indent=2)
+        print(f"[save_run_summary] {reason} → {metrics_path}")
+        print(f"  cov={metrics['coverage_percent']:.1f}% "
+              f"fr={metrics['frontier_cells']} "
+              f"grayGap={metrics['gray_gap_cells']}/{metrics['gray_gap_components']} "
+              f"obsBoundary={metrics['obs_boundary_cells']}")
+    except Exception as exc:
+        print(f"[save_run_summary] error: {type(exc).__name__}: {exc}")
+
+
 def reset_map():
     global log_odds, visual_log_odds, thin_obstacle_log_odds, contact_log_odds, structural_log_odds, under_surface_log_odds, hypothesis_obstacle_log_odds
     global hypothesis_obstacle_cache, hypothesis_obstacle_cache_step, last_hypothesis_obstacle_debug, last_near_collision_hypothesis_time, last_near_collision_hypothesis_debug
@@ -18453,4 +18572,9 @@ while robot.step(timestep) != -1:
     step_id += 1
 
 set_wheel_speeds(0, 0)
+if AUTO_SAVE_ON_SIM_END:
+    try:
+        save_run_summary("sim_end")
+    except Exception:
+        pass
 cv2.destroyAllWindows()
