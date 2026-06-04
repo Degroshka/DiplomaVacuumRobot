@@ -525,6 +525,8 @@ frontier_only_stall_theta = 0.0
 frontier_only_stall_blacklists = 0
 frontier_only_last_blacklist_time = -999.0
 frontier_only_last_stall_debug = "stall=idle"
+frontier_only_stall_best_cov = -1.0
+frontier_only_stall_best_cov_time = -999.0
 frontier_direct_last_unsafe_recovery_at = -999.0
 frontier_direct_last_unsafe_recovery_debug = "unsafeRecovery=idle"
 post_turn_rgbd_snapshot_until = -999.0
@@ -7590,6 +7592,7 @@ def frontier_only_stall_watchdog_update(route_present, route_reason, safe_snapsh
     """Return an action string for frontier-only deadlock recovery."""
     global frontier_only_stall_since, frontier_only_stall_x, frontier_only_stall_y, frontier_only_stall_theta
     global frontier_only_stall_blacklists, frontier_only_last_blacklist_time, frontier_only_last_stall_debug
+    global frontier_only_stall_best_cov, frontier_only_stall_best_cov_time
     if not EXPLORATION_FRONTIER_ONLY_STALL_WATCHDOG_ENABLED:
         frontier_only_last_stall_debug = "stall=off"
         return "none"
@@ -7597,6 +7600,21 @@ def frontier_only_stall_watchdog_update(route_present, route_reason, safe_snapsh
         now = float(robot.getTime())
     except Exception:
         now = 0.0
+
+    # Coverage-progress stall: fires even when the robot is physically moving but
+    # map coverage has been flat.  This catches the "washing machine" loop where
+    # recovery maneuvers (CONTACT_BACKUP / GRID_REALIGN) continuously reset the
+    # pose-based stall timer while the robot bounces near a blocked frontier zone.
+    cov_f = float(cov) if cov is not None else 0.0
+    if frontier_only_stall_best_cov_time < -100.0:
+        frontier_only_stall_best_cov = cov_f
+        frontier_only_stall_best_cov_time = now
+    elif cov_f > float(frontier_only_stall_best_cov) + float(EXPLORATION_FRONTIER_ONLY_STALL_COV_GAIN_PERCENT):
+        frontier_only_stall_best_cov = cov_f
+        frontier_only_stall_best_cov_time = now
+    cov_stall_sec = max(0.0, now - float(frontier_only_stall_best_cov_time))
+    cov_stalled = cov_stall_sec >= float(EXPLORATION_FRONTIER_ONLY_STALL_COV_TIMEOUT_SEC)
+
     moved = math.hypot(float(pose_x) - float(frontier_only_stall_x), float(pose_y) - float(frontier_only_stall_y))
     turned = abs(normalize_angle(float(pose_theta) - float(frontier_only_stall_theta)))
     if (
@@ -7608,10 +7626,18 @@ def frontier_only_stall_watchdog_update(route_present, route_reason, safe_snapsh
         frontier_only_stall_x = float(pose_x)
         frontier_only_stall_y = float(pose_y)
         frontier_only_stall_theta = float(pose_theta)
-        frontier_only_last_stall_debug = "stall=reset"
-        return "none"
-    stall_sec = max(0.0, now - float(frontier_only_stall_since))
-    frontier_only_last_stall_debug = f"stall={stall_sec:.0f}s bl={frontier_only_stall_blacklists} safe={int(bool(safe_snapshot))}"
+        if not cov_stalled:
+            frontier_only_last_stall_debug = "stall=reset"
+            return "none"
+        # Robot is physically moving but coverage is frozen — fall through to
+        # blacklist logic below using the coverage-stall elapsed time.
+        stall_sec = cov_stall_sec
+        frontier_only_last_stall_debug = f"stall=covFlat {cov_stall_sec:.0f}s cov={cov_f:.1f} bl={frontier_only_stall_blacklists}"
+    else:
+        stall_sec = max(0.0, now - float(frontier_only_stall_since))
+        if cov_stalled:
+            stall_sec = max(stall_sec, cov_stall_sec)
+        frontier_only_last_stall_debug = f"stall={stall_sec:.0f}s bl={frontier_only_stall_blacklists} safe={int(bool(safe_snapshot))}"
     if stall_sec < float(EXPLORATION_FRONTIER_ONLY_STALL_TIMEOUT_SEC):
         return "none"
     # If a long sequence of unreachable local frontiers produces no map progress,
@@ -7647,6 +7673,8 @@ def frontier_only_stall_watchdog_update(route_present, route_reason, safe_snapsh
                 frontier_only_stall_x = float(pose_x)
                 frontier_only_stall_y = float(pose_y)
                 frontier_only_stall_theta = float(pose_theta)
+                frontier_only_stall_best_cov = cov_f
+                frontier_only_stall_best_cov_time = now
                 frontier_only_last_stall_debug = f"stall=blacklist {int(gx)},{int(gy)} bl={frontier_only_stall_blacklists}"
                 return "blacklist"
         except Exception as exc:
@@ -7702,6 +7730,39 @@ def exploration_frontier_only_owner_gate(front, center, body_clearance, left=Non
     # row controller keep moving and collect more RGB-D evidence instead of holding
     # owner=NONE on a noisy/shadow frontier.
     if hybrid_local_mapping_active(cov):
+        # Short-route exception: if a nearby frontier route is already computed
+        # and passes all safety checks, commit it rather than ignoring it.
+        # Without this, the robot can see the frontier target on the map but
+        # keeps driving in the wrong direction because the gate returns False
+        # before ever reaching the route-commit check below.
+        if EXPLORATION_FRONTIER_HYBRID_SHORT_COMMIT_ENABLED and FRONTIER_DIRECT_MAPPING_HOLD_IF_ROUTE_OK:
+            try:
+                route_cost_val = float(coverage_route_cost)
+            except Exception:
+                route_cost_val = 99.0
+            if (
+                math.isfinite(route_cost_val)
+                and route_cost_val <= float(EXPLORATION_FRONTIER_HYBRID_SHORT_COMMIT_MAX_COST_M)
+                and coverage_route_kind == "frontier"
+                and coverage_goal_kind == "frontier"
+                and coverage_goal_map is not None
+                and coverage_route_map
+            ):
+                try:
+                    short_ok, short_reason = coverage_candidate_is_committable(front, center, body_clearance)
+                except Exception as exc:
+                    short_ok, short_reason = False, f"hybrid-short err {type(exc).__name__}"
+                if short_ok:
+                    try:
+                        if str(control_lock.owner) == ControlOwner.ROW_FORWARD.value:
+                            release_control("hybrid-row short frontier will own")
+                    except Exception:
+                        pass
+                    last_frontier_only_gate_debug = (
+                        f"frontierGate=hybrid-short cost={route_cost_val:.2f} cov={cov:.1f}"
+                    )
+                    last_planner_update_step = -999999
+                    return True
         last_frontier_only_gate_debug = f"frontierGate=hybrid-row cov={cov:.1f}/{EXPLORATION_FRONTIER_ONLY_MIN_COVERAGE_PERCENT:.1f}"
         return False
 
