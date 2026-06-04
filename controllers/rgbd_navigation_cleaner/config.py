@@ -549,6 +549,29 @@ CONTACT_RECOVERY_STATES = (
     NAV_CONTACT_ROTATE,
     NAV_CONTACT_FORWARD,
 )
+# Quantitative experiment metrics (diploma report).  Ported from the main-folder
+# experiment branch: writes *_timeseries.csv / *_events.csv / *_summary.json into
+# the metrics/ dir; analyse with tools/analyze_metrics.py.  Press M to export.
+METRICS_ENABLED = True
+METRICS_DIR_NAME = "metrics"
+METRICS_SAMPLE_PERIOD_SEC = 1.0
+METRICS_HEAVY_SAMPLE_PERIOD_SEC = 5.0
+METRICS_EXPORT_ON_SAVE = True
+METRICS_KEY_EXPORT_ENABLED = True
+# Periodic auto-export of summary.json while running (no keypress needed) so an
+# up-to-date aggregate survives an abrupt Webots kill.  timeseries.csv is written
+# continuously regardless.
+METRICS_SUMMARY_AUTOEXPORT_SEC = 20.0
+
+# Ground-truth obstacle-map metrics (false-occupied / false-free cell ratios).
+# Built from the .wbt world geometry and compared against the learned obstacle
+# mask.  Requires the metrics GPS for world<->map alignment; silently disabled if
+# absent.  Evaluation-only; never used by navigation.
+GROUND_TRUTH_METRICS_ENABLED = True
+GROUND_TRUTH_ROBOT_HEIGHT_M = 0.12
+GROUND_TRUTH_FLOOR_EPS_M = 0.02
+GROUND_TRUTH_WALL_THICKNESS_M = 0.06
+
 MAPPING_ALLOWED_STATES = (NAV_FORWARD, NAV_LANE_SHIFT, NAV_LEG_PASS_FORWARD, NAV_CONTACT_FORWARD, NAV_SCAN_AROUND, NAV_RGBD_SNAPSHOT)
 MAPPING_FREEZE_STATES = (
     NAV_TURN_90, NAV_SETTLE, NAV_RECOVERY_BACKUP,

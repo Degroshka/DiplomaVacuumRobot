@@ -36,6 +36,8 @@ from recovery import decide_side_release_after_backup
 from control_arbiter import ControlOwner, OwnershipLock
 from wall_follow_controller import WallFollowConfig, WallFollowInput, compute_wall_follow_command
 from async_debug_viewer import AsyncDebugViewerClient
+from metrics_recorder import MetricsRecorder
+import ground_truth_map
 
 try:
     import cv2
@@ -127,6 +129,15 @@ if inertial_unit is not None:
 else:
     print('WARNING: InertialUnit "inertial_unit" not found; falling back to pure wheel odometry heading.')
 
+# Ground-truth GPS for localization-accuracy metrics only (never used by
+# navigation/mapping).  Optional: if the world has no GPS, metrics simply skip
+# the localization-error fields.
+gt_gps = robot.getDevice("gt_gps")
+if gt_gps is not None:
+    gt_gps.enable(timestep)
+else:
+    print('NOTE: GPS "gt_gps" not found; localization-error metrics disabled (add a GPS node to the robot to enable).')
+
 front_left_bumper = robot.getDevice("front_left_bumper")
 front_center_bumper = robot.getDevice("front_center_bumper")
 front_right_bumper = robot.getDevice("front_right_bumper")
@@ -143,8 +154,22 @@ for bumper_name, bumper in (
 out_dir = Path(__file__).resolve().parent
 frames_dir = out_dir / "camera_frames"
 maps_dir = out_dir / "maps"
+metrics_dir = out_dir / METRICS_DIR_NAME
 frames_dir.mkdir(exist_ok=True)
 maps_dir.mkdir(exist_ok=True)
+metrics_dir.mkdir(exist_ok=True)
+metrics_session_name = f"metrics_{int(time.time())}"
+metrics_recorder = MetricsRecorder(metrics_dir, metrics_session_name, enabled=METRICS_ENABLED)
+metrics_last_sample_time = -999.0
+metrics_last_heavy_sample_time = -999.0
+metrics_last_autoexport_time = -999.0
+metrics_path_length_m = 0.0
+metrics_prev_pose = None
+metrics_gps_origin = None
+metrics_odom_origin = None
+metrics_gt_grid = None
+metrics_gt_debug = "gt=init"
+metrics_last_debug = "metrics=init"
 
 
 pose_x = 0.0
@@ -1190,6 +1215,8 @@ def handle_window_key(key):
     key_actions = {
         ord('s'): save_map,
         ord('S'): save_map,
+        ord('m'): lambda: export_metrics_summary('key'),
+        ord('M'): lambda: export_metrics_summary('key'),
         ord('r'): reset_map,
         ord('R'): reset_map,
         ord('+'): lambda: set_map_zoom(MAP_VIEW_ZOOM_STEP),
@@ -1294,7 +1321,7 @@ def compact_debug_status_line():
         f"{runtime_arena_guard_debug[:24]} {odom_arena_clamp_debug[:22]} {frontier_route_abort_hold_debug[:24]} "
         f"{last_hypothesis_obstacle_debug[:28]} {last_near_collision_hypothesis_debug[:22]} {last_low_obstacle_memory_debug[:22]} "
         f"plan={last_planning_layer_debug[:34]} "
-        f"scan={last_active_scan_debug[:28]} gate={last_frontier_only_gate_debug[:30]} occ={last_rgbd_occlusion_debug[:18]} {last_debug_viewer_status[:22]} {last_render_throttle_debug[:18]} {load_shedding_debug_text()[:24]}"
+        f"scan={last_active_scan_debug[:28]} gate={last_frontier_only_gate_debug[:30]} occ={last_rgbd_occlusion_debug[:18]} {last_debug_viewer_status[:22]} {last_render_throttle_debug[:18]} {load_shedding_debug_text()[:24]} {metrics_last_debug[:22]}"
     )
 
 
@@ -18195,6 +18222,8 @@ def save_map():
     print("Map saved:", path)
     print("Coverage objective map saved:", planner_path)
     print("Save is passive: motion owner remains", last_control_owner_debug, auto_map_ready_debug, learned_map_sanitize_debug)
+    if METRICS_EXPORT_ON_SAVE:
+        export_metrics_summary("save_map")
 
 
 def save_run_summary(reason=""):
@@ -18516,6 +18545,230 @@ def reset_map():
     invalidate_heavy_map_caches("reset")
     print("Map reset")
 
+def update_metrics_path_length():
+    """Accumulate travelled path length from the same odometry pose used by maps."""
+    global metrics_path_length_m, metrics_prev_pose
+    try:
+        cur = (float(pose_x), float(pose_y))
+        if metrics_prev_pose is not None:
+            dx = cur[0] - float(metrics_prev_pose[0])
+            dy = cur[1] - float(metrics_prev_pose[1])
+            ds = math.hypot(dx, dy)
+            # Ignore teleport/reset jumps and sub-millimetre numerical jitter.
+            if 0.0005 <= ds <= 0.35:
+                metrics_path_length_m += ds
+        metrics_prev_pose = cur
+    except Exception:
+        pass
+
+
+def localization_error_fields():
+    """Ground-truth vs odometry localization error from the metrics-only GPS.
+
+    Returns a dict with gt_x_m/gt_y_m/localization_error_m, or {} if no GPS.
+    The error is the displacement mismatch since the first sample: how far the
+    odometry-estimated travel diverges from the true travel.  This is coordinate-
+    frame agnostic (both displacements are measured from their own t0 origin) and
+    needs no absolute alignment between the odometry and world frames.
+    """
+    global metrics_gps_origin, metrics_odom_origin
+    if gt_gps is None:
+        return {}
+    try:
+        vals = gt_gps.getValues()
+        if vals is None or len(vals) < 2 or not all(math.isfinite(v) for v in vals[:2]):
+            return {}
+        gx, gy = float(vals[0]), float(vals[1])
+        if metrics_gps_origin is None:
+            metrics_gps_origin = (gx, gy)
+            metrics_odom_origin = (float(pose_x), float(pose_y))
+        true_dx = gx - metrics_gps_origin[0]
+        true_dy = gy - metrics_gps_origin[1]
+        odom_dx = float(pose_x) - metrics_odom_origin[0]
+        odom_dy = float(pose_y) - metrics_odom_origin[1]
+        loc_err = math.hypot(odom_dx - true_dx, odom_dy - true_dy)
+        return {
+            "gt_x_m": gx,
+            "gt_y_m": gy,
+            "localization_error_m": loc_err,
+        }
+    except Exception:
+        return {}
+
+
+def _gt_world_to_map(wx, wy):
+    """Webots world (x,y) -> controller map cell, aligned via the t0 GPS sample."""
+    ox = float(wx) - metrics_gps_origin[0] + metrics_odom_origin[0]
+    oy = float(wy) - metrics_gps_origin[1] + metrics_odom_origin[1]
+    return (int(round(MAP_ORIGIN_X + ox * MAP_SCALE)), int(round(MAP_ORIGIN_Y - oy * MAP_SCALE)))
+
+
+def build_ground_truth_grid_if_ready():
+    """Build the .wbt ground-truth obstacle grid once, after the t0 GPS origin is known."""
+    global metrics_gt_grid, metrics_gt_debug
+    if not (GROUND_TRUTH_METRICS_ENABLED and METRICS_ENABLED):
+        return None
+    if metrics_gt_grid is not None:
+        return metrics_gt_grid
+    if metrics_gps_origin is None or metrics_odom_origin is None:
+        metrics_gt_debug = "gt=wait gps"
+        return None
+    try:
+        wbt_path = robot.getWorldPath()
+        parsed = ground_truth_map.parse_world_obstacles(wbt_path)
+        grid, drawn = ground_truth_map.build_ground_truth_grid(
+            parsed, _gt_world_to_map, MAP_SIZE,
+            robot_height_m=GROUND_TRUTH_ROBOT_HEIGHT_M,
+            floor_eps_m=GROUND_TRUTH_FLOOR_EPS_M,
+            wall_thickness_m=GROUND_TRUTH_WALL_THICKNESS_M,
+            map_scale=MAP_SCALE,
+        )
+        metrics_gt_grid = grid
+        metrics_gt_debug = f"gt=built obs={drawn} cells={int(np.count_nonzero(grid))}"
+        print("[METRICS] ground-truth obstacle map built:", metrics_gt_debug)
+        return metrics_gt_grid
+    except Exception as exc:
+        metrics_gt_debug = f"gt=err {type(exc).__name__}"
+        return None
+
+
+def collect_metrics_snapshot(heavy=False):
+    """Build one metrics row for quantitative experiments.
+
+    The light part is cheap and sampled every second.  The heavy part touches map
+    masks and quality checks; it is sampled less often so it does not distort the
+    real-time controller being measured.
+    """
+    global metrics_last_debug
+    now = float(robot.getTime())
+    snap = {
+        "time_s": now,
+        "step_id": int(step_id),
+        "pose_x_m": float(pose_x),
+        "pose_y_m": float(pose_y),
+        "pose_theta_deg": math.degrees(float(pose_theta)),
+        "path_length_m": float(metrics_path_length_m),
+        "coverage_percent": float(last_coverage_percent or 0.0),
+        "coverage_cleaned_cells": int(last_coverage_cleaned_cells or 0),
+        "coverage_total_cells": int(last_coverage_total_cells or 0),
+        "uncleaned_cells": int(last_uncleaned_cells or 0),
+        "frontier_cells": int(last_frontier_cells or 0),
+        "gray_gap_cells": int(last_gray_gap_cells or 0),
+        "gray_gap_components": int(last_gray_gap_components or 0),
+        "planner_intent": str(planner_intent),
+        "planner_mode": str(planner_mode),
+        "navigation_phase": str(navigation_phase),
+        "nav_state": str(nav_state),
+        "owner_source": str(current_owner_source_label()),
+        "control_owner": str(last_control_owner_debug),
+        "route_active": bool(route_commit_active),
+        "route_kind": str(route_commit_kind),
+        "route_len_cells": int(len(route_commit_route_map or [])),
+        "route_cost_m": float(route_commit_cost) if np.isfinite(route_commit_cost) else -1.0,
+        "route_status": str(coverage_route_status),
+        "map_mature": bool(map_mature),
+        "known_map_active": bool(known_map_coverage_eval_active()),
+        "dock_completed": bool(dock_return_completed),
+        "loop_ms": float(last_perf_loop_ms or 0.0),
+        "planner_ms": float(last_route_planner_ms or 0.0),
+        "planner_nodes": int(last_route_planner_nodes or 0),
+        "load_shedding": str(load_shedding_debug_text()),
+        "bumper_active": bool(last_bumper_any_raw_active),
+        "low_obstacle_debug": str(last_low_obstacle_memory_debug),
+    }
+    snap.update(localization_error_fields())
+    if heavy:
+        try:
+            actual, center_no_go, cleanable_floor = build_planning_layers(force=False)
+            raw = base_physical_obstacle_mask().astype(np.bool_)
+            contact = (contact_log_odds > CONTACT_OCCUPIED_EPS).astype(np.bool_)
+            structural = (structural_log_odds > STRUCTURAL_OCCUPIED_EPS).astype(np.bool_) if STRUCTURAL_OBSTACLE_MEMORY_ENABLED else np.zeros_like(raw, dtype=np.bool_)
+            thin = (thin_obstacle_log_odds > THIN_OBSTACLE_CONFIRM_EPS).astype(np.bool_) if THIN_OBSTACLE_CONFIRM_ENABLED else np.zeros_like(raw, dtype=np.bool_)
+            hyp = hypothesis_obstacle_mask(force=False).astype(np.bool_) if OBSTACLE_HYPOTHESIS_ENABLED else np.zeros_like(raw, dtype=np.bool_)
+            protected = contact | structural | thin
+            weak_unconfirmed = actual.astype(np.bool_) & (~protected)
+            # learned_map_static_quality_gate is not present on this branch; keep
+            # the quality field optional so the heavy sample still records masks.
+            if "learned_map_static_quality_gate" in globals():
+                total_for_quality = int(last_coverage_total_cells or np.count_nonzero(cleanable_floor))
+                quality_ok, quality_debug = globals()["learned_map_static_quality_gate"](obs_mask=actual.astype(np.bool_), total_cells=total_for_quality)
+            else:
+                quality_ok, quality_debug = True, "quality_gate=n/a"
+            snap.update({
+                "raw_obstacle_cells": int(np.count_nonzero(raw)),
+                "actual_obstacle_cells": int(np.count_nonzero(actual)),
+                "no_go_cells": int(np.count_nonzero(center_no_go)),
+                "hypothesis_obstacle_cells": int(np.count_nonzero(hyp)),
+                "contact_obstacle_cells": int(np.count_nonzero(contact)),
+                "structural_obstacle_cells": int(np.count_nonzero(structural)),
+                "thin_obstacle_cells": int(np.count_nonzero(thin)),
+                "weak_unconfirmed_obstacle_cells": int(np.count_nonzero(weak_unconfirmed)),
+                "quality_ok": bool(quality_ok),
+                "quality_debug": str(quality_debug),
+            })
+            # Ground-truth obstacle-map accuracy: compare the learned obstacle mask
+            # against the .wbt reference, restricted to explored cells so unknown
+            # areas are not counted as error.
+            gt_grid = build_ground_truth_grid_if_ready()
+            if gt_grid is not None:
+                explored = actual.astype(np.bool_) | cleanable_floor.astype(np.bool_)
+                gt_stats = ground_truth_map.false_cell_metrics(actual.astype(np.bool_), gt_grid, explored)
+                snap.update({
+                    "gt_obstacle_cells": gt_stats["gt_obstacle_cells"],
+                    "false_occupied_cells": gt_stats["false_occupied_cells"],
+                    "false_free_cells": gt_stats["false_free_cells"],
+                    "false_occupied_ratio": gt_stats["false_occupied_ratio"],
+                    "obstacle_precision": gt_stats["obstacle_precision"],
+                    "obstacle_recall": gt_stats["obstacle_recall"],
+                })
+            metrics_last_debug = f"metrics=sample heavy weak={int(np.count_nonzero(weak_unconfirmed))}"
+        except Exception as exc:
+            snap.update({"quality_ok": False, "quality_debug": f"metrics heavy err {type(exc).__name__}"})
+            metrics_last_debug = f"metrics=err {type(exc).__name__}"
+    else:
+        metrics_last_debug = "metrics=sample light"
+    return snap
+
+
+def record_metrics_if_due(force=False):
+    global metrics_last_sample_time, metrics_last_heavy_sample_time, metrics_last_autoexport_time
+    if not METRICS_ENABLED:
+        return
+    try:
+        now = float(robot.getTime())
+        update_metrics_path_length()
+        if (not force) and now - float(metrics_last_sample_time) < float(METRICS_SAMPLE_PERIOD_SEC):
+            return
+        heavy = force or (now - float(metrics_last_heavy_sample_time) >= float(METRICS_HEAVY_SAMPLE_PERIOD_SEC))
+        snap = collect_metrics_snapshot(heavy=heavy)
+        metrics_recorder.record(snap)
+        metrics_last_sample_time = now
+        if heavy:
+            metrics_last_heavy_sample_time = now
+        # Periodic autosave of summary.json/latest_summary.json so a final
+        # aggregate exists even if Webots is killed instead of exiting cleanly.
+        # The per-second timeseries.csv is already flushed continuously above.
+        if now - float(metrics_last_autoexport_time) >= float(METRICS_SUMMARY_AUTOEXPORT_SEC):
+            metrics_recorder.export_summary()
+            metrics_last_autoexport_time = now
+    except Exception as exc:
+        # Metrics must never stop the robot controller.
+        globals()["metrics_last_debug"] = f"metrics=err {type(exc).__name__}"
+
+
+def export_metrics_summary(reason="manual"):
+    if not METRICS_ENABLED:
+        return None
+    try:
+        record_metrics_if_due(force=True)
+        summary = metrics_recorder.export_summary()
+        print("Metrics exported:", metrics_recorder.summary_path, "reason=", reason)
+        return summary
+    except Exception as exc:
+        print("Metrics export failed:", type(exc).__name__, exc)
+        return None
+
+
 # ---------------- Main loop ----------------
 if SHOW_WINDOWS:
     if ASYNC_DEBUG_VIEWER_ENABLED:
@@ -18566,6 +18819,7 @@ while robot.step(timestep) != -1:
     run_window_stage(frame, depth)
 
     last_perf_loop_ms = perf_end("loop", loop_t0)
+    record_metrics_if_due()
     last_perf_debug = perf_text(150)
     print_debug_status_if_due()
 
@@ -18577,4 +18831,9 @@ if AUTO_SAVE_ON_SIM_END:
         save_run_summary("sim_end")
     except Exception:
         pass
+try:
+    export_metrics_summary("controller exit")
+    metrics_recorder.close()
+except Exception:
+    pass
 cv2.destroyAllWindows()
