@@ -284,6 +284,14 @@ Robot {
       name "inertial_unit"
     }
 
+    # Ground-truth pose reference for localization-accuracy metrics ONLY.
+    # The navigation/mapping stack does NOT consume this; it is read solely to
+    # compare wheel/IMU odometry against the simulator's true position so the
+    # report can quantify localization error (mean/max/RMSE).
+    GPS {
+      name "gt_gps"
+    }
+
     # bumper geometry: bumper pads are now the foremost contact surfaces.
     # wrapped the front arc visually, but the passive front sensor shell was still
     # farther forward than the center bumper.  That allowed the rigid body/shell to take

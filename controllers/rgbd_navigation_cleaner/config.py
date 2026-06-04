@@ -125,6 +125,24 @@ EXPLORATION_FRONTIER_ONLY_OWNER_GATE_ENABLED = True
 EXPLORATION_FRONTIER_ONLY_MIN_COVERAGE_PERCENT = 48.0
 EXPLORATION_FRONTIER_ONLY_MIN_FRONTIER_CELLS = PLANNER_INTENT_MIN_FRONTIER_CELLS_EARLY
 HYBRID_LOCAL_MOTION_RESTORE_ENABLED = True
+# Short-route exception inside hybrid-row mode: if a nearby frontier route is
+# already computed and passes safety checks, commit it instead of continuing
+# ROW_FORWARD — prevents the robot from ignoring a visible nearby frontier.
+EXPLORATION_FRONTIER_HYBRID_SHORT_COMMIT_ENABLED = True
+EXPLORATION_FRONTIER_HYBRID_SHORT_COMMIT_MAX_COST_M = 1.80
+# Obstacle-boundary vantage frontiers (kind=4 "obs-boundary"):
+# When an obstacle cluster has unexplored gray cells on its sides, generate
+# vantage targets just outside the cluster so the robot navigates there to
+# capture the unseen faces rather than relying on accidental close passes.
+OBS_BOUNDARY_FRONTIER_ENABLED = True
+OBS_BOUNDARY_FRONTIER_MIN_CLUSTER_CELLS = 80
+OBS_BOUNDARY_FRONTIER_MIN_ADJACENT_UNKNOWN = 30
+OBS_BOUNDARY_FRONTIER_APPROACH_M = 0.28
+OBS_BOUNDARY_FRONTIER_MIN_LOCAL_CELLS = 8
+OBS_BOUNDARY_FRONTIER_REWARD = 9.5
+OBS_BOUNDARY_FRONTIER_BONUS_SCALE = 0.04
+OBS_BOUNDARY_FRONTIER_BONUS_MAX = 5.0
+OBS_BOUNDARY_FRONTIER_MIN_COVERAGE_PERCENT = 28.0
 EXPLORATION_FRONTIER_SINGLE_POINT_COMMIT_ENABLED = True
 EXPLORATION_FRONTIER_SINGLE_POINT_MAX_COST_M = 0.90
 EXPLORATION_FRONTIER_SINGLE_POINT_MAX_STRAIGHT_M = 0.95
@@ -146,14 +164,58 @@ EXPLORATION_FRONTIER_ONLY_SNAPSHOT_COOLDOWN_SEC = 4.8
 EXPLORATION_FRONTIER_ONLY_SNAPSHOT_MIN_FRONT_CLEAR_M = 0.30
 EXPLORATION_FRONTIER_ONLY_SNAPSHOT_MIN_BODY_CLEAR_M = 0.070
 EXPLORATION_FRONTIER_ONLY_STALL_WATCHDOG_ENABLED = True
+# Anti-freeze: hand motion back to ROW_FORWARD if the frontier-only gate has held
+# a stationary robot (owner=NONE) this long with no committable route, instead of
+# standing still until the slower blacklist/dock escalation fires.
+EXPLORATION_FRONTIER_ONLY_HOLD_RELEASE_SEC = 15.0
 EXPLORATION_FRONTIER_ONLY_STALL_TIMEOUT_SEC = 12.0
 EXPLORATION_FRONTIER_ONLY_STALL_POSE_EPS_M = 0.07
 EXPLORATION_FRONTIER_ONLY_STALL_HEADING_EPS_RAD = math.radians(18.0)
+# Coverage-progress stall: fires even when the robot is physically moving but
+# map coverage has not grown.  Catches the "washing machine" loop where recovery
+# maneuvers (CONTACT_BACKUP / GRID_REALIGN) continuously reset the pose-based
+# stall timer while the robot bounces in a blocked frontier zone.
+EXPLORATION_FRONTIER_ONLY_STALL_COV_GAIN_PERCENT = 0.35
+EXPLORATION_FRONTIER_ONLY_STALL_COV_TIMEOUT_SEC = 55.0
 EXPLORATION_FRONTIER_ONLY_STALL_RETURN_TIMEOUT_SEC = 46.0
 EXPLORATION_FRONTIER_ONLY_STALL_RETURN_MIN_COVERAGE_PERCENT = 47.5
 EXPLORATION_FRONTIER_ONLY_STALL_BLACKLIST_RADIUS_M = 0.68
 EXPLORATION_FRONTIER_ONLY_STALL_BLACKLIST_SEC = 95.0
 EXPLORATION_FRONTIER_ONLY_STALL_MAX_BLACKLISTS_BEFORE_DOCK = 4
+
+# Late map-completion priority: when the map still contains coherent unknown
+# pockets inside/near the known room, they must outrank easy wall-side frontiers.
+COMPLETION_PRIORITY_ENABLED = True
+COMPLETION_PRIORITY_MIN_COVERAGE_PERCENT = 34.0
+COMPLETION_PRIORITY_MIN_COMPONENT_CELLS = 65
+COMPLETION_PRIORITY_MAX_COMPONENT_CELLS = 22000
+COMPLETION_PRIORITY_NEAR_CLEANABLE_M = 0.82
+COMPLETION_PRIORITY_OBSTACLE_NEAR_M = 0.20
+COMPLETION_PRIORITY_BOUNDARY_BAND_M = 0.52
+COMPLETION_PRIORITY_MIN_CLEAN_EDGE_CELLS = 20
+COMPLETION_PRIORITY_FRONTIER_DILATE_M = 0.13
+COMPLETION_PRIORITY_LOCAL_RADIUS_M = 0.74
+COMPLETION_PRIORITY_MIN_LOCAL_CELLS = 20
+COMPLETION_PRIORITY_REWARD = 32.0
+COMPLETION_PRIORITY_LOCAL_BONUS_SCALE = 0.055
+COMPLETION_PRIORITY_LOCAL_BONUS_MAX = 38.0
+COMPLETION_PRIORITY_FORCE_ROUTE_COVERAGE_PERCENT = 37.0
+COMPLETION_PRIORITY_FORCE_ROUTE_CELLS = 260
+COMPLETION_PRIORITY_COMPLETE_BLOCK_CELLS = 260
+COMPLETION_PRIORITY_COMPLETE_BLOCK_COMPS = 2
+COMPLETION_PRIORITY_STALL_DOCK_BLOCK_CELLS = 420
+
+# Prevent repeated late passes along the same already-seen wall band while
+# important completion/gray pockets remain elsewhere.  This is a scoring penalty
+# only; it does not change the online map or remove true walls/obstacles.
+RIGHT_WALL_REPEAT_SUPPRESS_ENABLED = True
+RIGHT_WALL_REPEAT_SUPPRESS_MIN_COVERAGE_PERCENT = 36.0
+RIGHT_WALL_REPEAT_SUPPRESS_MIN_GRAY_CELLS = 650
+RIGHT_WALL_REPEAT_SUPPRESS_EDGE_BAND_M = 1.10
+RIGHT_WALL_REPEAT_SUPPRESS_RECENT_RATIO = 0.18
+RIGHT_WALL_REPEAT_SUPPRESS_PENALTY = 42.0
+RIGHT_WALL_REPEAT_SUPPRESS_WITH_COMPLETION_PENALTY = 68.0
+RIGHT_WALL_REPEAT_SUPPRESS_NEAR_ROBOT_M = 2.25
 FRONTIER_FALLBACK_DIRECT_ROUTE_ENABLED = True
 FRONTIER_FALLBACK_DIRECT_MAX_BLOCKED_RATIO = 0.16
 FRONTIER_FALLBACK_DIRECT_MAX_DIST_M = 1.55
@@ -365,6 +427,15 @@ LO_MAX = 7.0
 CONTACT_OCCUPIED_EPS = 1.0
 CONTACT_OCC_UPDATE = 2.7
 CONTACT_FREE_UPDATE = -0.38
+# Protect bumper-confirmed contact from being erased by depth that cannot see
+# LOW objects (e.g. the 10 cm red box sits below the forward camera FOV, so the
+# depth ray passes over it and reports "free").  While the contact is still
+# strongly confirmed, depth clears it much more slowly, so a low object the robot
+# physically hit stays on the map long enough for the planner to route around it
+# instead of driving back into it.  It can still be cleared once it has decayed.
+CONTACT_DEPTH_CLEAR_PROTECT_ENABLED = False
+CONTACT_DEPTH_CLEAR_PROTECT_EPS = 1.0
+CONTACT_DEPTH_CLEAR_PROTECT_FACTOR = 0.22
 CONTACT_MIN = 0.0
 CONTACT_MAX = 5.2
 CONTACT_MARK_RADIUS_M = 0.035
@@ -386,6 +457,18 @@ NO_HIT_FREE_RANGE = 0.35
 TURN_MAPPING_OMEGA_LIMIT = 0.12
 TURN_THIN_OMEGA_LIMIT = 0.10
 TURN_FREEZE_HOLD_SEC = 0.25
+# Forward-arc mapping exception: the omega freeze above exists to kill depth
+# "fan" artifacts from near-stationary pivots (TURN_IN_PLACE / FINE_ALIGN), where
+# the robot rotates without translating and rays spread from one point.  But the
+# heading-lock corrects course with a differential arc (base±corr), so even a
+# straight drive trips the omega limit and freezes mapping unnecessarily.  A
+# smooth forward arc (large turn radius R=v/omega while translating) changes
+# heading only a fraction of a degree per map frame and is safe to map.  Keep
+# mapping when driving forward with a large enough arc radius; set ENABLED False
+# to restore the strict freeze.
+FORWARD_ARC_MAPPING_ENABLED = True
+FORWARD_ARC_MAPPING_MIN_LINEAR_MPS = 0.10
+FORWARD_ARC_MAPPING_MIN_RADIUS_M = 0.40
 TURN_OCC_MAX_RANGE = 0.70
 TURN_FREE_MAX_RANGE = 0.00
 DEPTH_JUMP_REJECT = 0.20
@@ -448,6 +531,25 @@ CV_LOW_STRIP_MAX_HEIGHT_FRAC = 0.22
 CV_LINE_SAMPLE_STEP_PX = 18
 CV_LINE_MAX_DEPTH_SPAN_M = 0.55
 CV_LINE_MAX_DEPTH_STD_M = 0.24
+# Connecting projected line endpoints with a filled segment is the main source
+# of the diagonal "fan" false-occupied streaks: when depth along the RGB line is
+# noisy, the sampled points project into a spreading fan, and the bresenham fill
+# turns that fan into solid diagonal strokes.  Only connect when the intermediate
+# projected points actually lie on the straight p0->p1 line (a real wall edge);
+# otherwise leave isolated dots that speckle/ray-streak cleanup can remove.
+CV_LINE_CONNECT_MAX_MAP_PX = 80
+CV_LINE_CONNECT_REQUIRE_COLLINEAR = True
+CV_LINE_CONNECT_MAX_PERP_DEV_M = 0.05
+# Height filter for CV obstacle features: the robot is ~0.12 m tall and only
+# collides with floor-level structure (legs, low furniture).  A chair backrest,
+# seat, or table top is ABOVE the robot — projecting those RGB-D features onto
+# the 2D map turns the whole piece into a smeared obstacle instead of clean
+# legs.  Estimate each feature's world height from its image row + depth and
+# skip the obstacle contribution above this height (free-space rays still pass).
+# Sensor height matches the .wbt camera translation (0.215 0 0.06).
+CV_HEIGHT_FILTER_ENABLED = True
+CV_SENSOR_HEIGHT_M = 0.06
+CV_MAX_OBSTACLE_HEIGHT_M = 0.18
 CV_FLOOR_PLANE_REJECT_ENABLED = True
 CV_FLOOR_PLANE_MIN_Y_FRACTION = 0.34
 CV_FLOOR_PLANE_MIN_DEPTH = 0.28
@@ -525,6 +627,36 @@ CONTACT_RECOVERY_STATES = (
     NAV_CONTACT_ROTATE,
     NAV_CONTACT_FORWARD,
 )
+# Quantitative experiment metrics (diploma report).  Ported from the main-folder
+# experiment branch: writes *_timeseries.csv / *_events.csv / *_summary.json into
+# the metrics/ dir; analyse with tools/analyze_metrics.py.  Press M to export.
+METRICS_ENABLED = True
+METRICS_DIR_NAME = "metrics"
+METRICS_SAMPLE_PERIOD_SEC = 1.0
+METRICS_HEAVY_SAMPLE_PERIOD_SEC = 5.0
+METRICS_EXPORT_ON_SAVE = True
+METRICS_KEY_EXPORT_ENABLED = True
+# Periodic auto-export of summary.json while running (no keypress needed) so an
+# up-to-date aggregate survives an abrupt Webots kill.  timeseries.csv is written
+# continuously regardless.
+METRICS_SUMMARY_AUTOEXPORT_SEC = 20.0
+
+# Ground-truth obstacle-map metrics (false-occupied / false-free cell ratios).
+# Built from the .wbt world geometry and compared against the learned obstacle
+# mask.  Requires the metrics GPS for world<->map alignment; silently disabled if
+# absent.  Evaluation-only; never used by navigation.
+GROUND_TRUTH_METRICS_ENABLED = True
+GROUND_TRUTH_ROBOT_HEIGHT_M = 0.12
+GROUND_TRUTH_FLOOR_EPS_M = 0.02
+GROUND_TRUTH_WALL_THICKNESS_M = 0.06
+# Match tolerance for obstacle-map comparison: the learned map is rarely aligned
+# to the .wbt geometry to the exact cell (depth/odometry noise + finite map
+# resolution put an obstacle a few cells off the true edge).  A robot obstacle
+# within this distance of a real one counts as correct (grey), instead of being
+# scored as false-occupied/missed.  ~0.06 m ≈ 5 px at MAP_SCALE=85.  Set 0 for
+# strict cell-exact scoring.
+GROUND_TRUTH_MATCH_TOLERANCE_M = 0.06
+
 MAPPING_ALLOWED_STATES = (NAV_FORWARD, NAV_LANE_SHIFT, NAV_LEG_PASS_FORWARD, NAV_CONTACT_FORWARD, NAV_SCAN_AROUND, NAV_RGBD_SNAPSHOT)
 MAPPING_FREEZE_STATES = (
     NAV_TURN_90, NAV_SETTLE, NAV_RECOVERY_BACKUP,
@@ -659,6 +791,74 @@ FURNITURE_ZONE_COLOR = (210, 70, 230)
 FURNITURE_ZONE_INFLATED_COLOR = (170, 120, 190)
 FURNITURE_ZONE_DRAW_OVERLAY = False
 FURNITURE_ZONE_DRAW_LABELS = False
+# Structural leg-quad fitting: detect small leg clusters, fit rectangles, snap
+# missing legs into structural_log_odds for robust furniture footprints.
+# Requires STRUCTURAL_OBSTACLE_MEMORY_ENABLED and FURNITURE_ZONE_DETECTION_ENABLED.
+FURNITURE_LEG_QUAD_ENABLED = True
+# Steps between full re-fits (25 ≈ 1.6 s at 64 ms timestep).
+FURNITURE_LEG_QUAD_UPDATE_STEPS = 25
+# Minimum detected leg candidates to attempt fitting.  Must be >=3: a rectangle
+# cannot be reconstructed from 2 points without inventing phantom corners.
+FURNITURE_LEG_QUAD_MIN_LEGS = 3
+# How many rectangle corners may be reconstructed without a real leg candidate
+# (the genuinely missing 4th leg).  Keep at 1 to avoid phantom furniture.
+FURNITURE_LEG_QUAD_MAX_INFERRED_CORNERS = 1
+# Connected-component size window for individual leg clusters (px).
+FURNITURE_LEG_QUAD_MIN_LEG_PX = 3
+FURNITURE_LEG_QUAD_MAX_LEG_PX = 90
+# Max aspect ratio of a leg bounding box (legs are compact, not elongated).
+FURNITURE_LEG_QUAD_LEG_MAX_ASPECT = 3.5
+# Spatial grouping distance – legs of the same piece of furniture.
+FURNITURE_LEG_QUAD_MAX_SPAN_M = 1.55
+# Minimum rectangle side to accept (filters out point-cloud noise pairs).
+FURNITURE_LEG_QUAD_MIN_SPAN_M = 0.28
+# Expected furniture footprints (long_side, short_side) in metres, from the .wbt
+# world: table legs span 1.1x0.7, chair legs ~0.5x0.5.  A fitted rectangle must
+# match one of these within SIZE_TOL, otherwise it is a mix of legs from
+# different pieces (e.g. 2 chair legs + 1 table leg) and is rejected.  Empty list
+# disables the size gate (falls back to the broad MIN/MAX_SPAN only).
+FURNITURE_LEG_QUAD_EXPECTED_SIZES_M = [(1.1, 0.7), (0.5, 0.5)]
+FURNITURE_LEG_QUAD_SIZE_TOL_M = 0.13
+# Snap tolerance expressed as a fraction of the longer bounding-box side.
+FURNITURE_LEG_QUAD_SNAP_TOL_FRAC = 0.32
+# Minimum fit quality [0, 1] required to stamp missing corners.
+FURNITURE_LEG_QUAD_MIN_QUALITY = 0.54
+# Radius of the disc stamped at each fitted corner (metres).
+FURNITURE_LEG_QUAD_FILL_RADIUS_M = 0.055
+# Log-odds added to structural_log_odds at each stamped corner cell.
+FURNITURE_LEG_QUAD_PROMOTE_SCORE = 3.5
+# Wall-line denoise: walls/large obstacles are mostly straight axis-aligned
+# lines.  Short diagonal/perpendicular "spurs" that stick out of a detected
+# wall line are RGB-D/depth ray noise, not real geometry.  This finds straight
+# wall segments via HoughLinesP and decays small adjacent spur components.
+# Conservative: never touches the wall body itself, nor contact/structural/
+# furniture-confirmed cells.  Toggle off to disable entirely.
+WALL_LINE_DENOISE_ENABLED = True
+WALL_LINE_DENOISE_UPDATE_STEPS = 14
+# A straight segment must be at least this long to count as a wall (metres).
+WALL_LINE_MIN_LENGTH_M = 0.45
+# Max pixel gap bridged when joining collinear segments (metres).
+WALL_LINE_MAX_GAP_M = 0.12
+# HoughLinesP accumulator vote threshold.
+WALL_LINE_HOUGH_THRESHOLD = 26
+# Only accept near-axis-aligned walls (rooms are rectangular); reject diagonals.
+WALL_LINE_AXIS_ALIGNED_ONLY = True
+WALL_LINE_ANGLE_TOL_DEG = 14.0
+# Half-thickness of the protected wall body around each detected line (metres).
+WALL_LINE_CORE_HALF_WIDTH_M = 0.05
+# Band beyond the wall body where spurs are searched for (metres).
+WALL_LINE_NEAR_BAND_M = 0.11
+# A spur candidate must be small and short to be erased.
+WALL_LINE_SPUR_MAX_AREA_PX = 40
+WALL_LINE_SPUR_MAX_LENGTH_M = 0.30
+# Shape gate: erase only elongated spurs (high bbox aspect), sparse line-like
+# stubs (low fill density — covers diagonals whose bbox looks square), or tiny
+# specks.  Compact dense leg-sized clusters near a wall are protected.
+WALL_LINE_SPUR_MIN_ASPECT = 2.2
+WALL_LINE_SPUR_MAX_DENSITY = 0.45
+WALL_LINE_SPUR_TINY_AREA_PX = 6
+# Log-odds the erased spur cells are pulled down to.
+WALL_LINE_DENOISE_DECAY_TO = -0.08
 PLANNING_LAYER_ENABLED = True
 PLANNING_CENTER_NO_GO_USES_FURNITURE_INFLATION = True
 PLANNING_CENTER_NO_GO_CLOSE_GAPS_M = 0.020
@@ -1095,8 +1295,44 @@ DOCK_ROUTE_GRID_PADDING_M = 0.85
 DOCK_ROUTE_NEAREST_GOAL_RADIUS = 8
 DOCK_STUCK_RETURN_COVERAGE_PERCENT = 96.0
 DOCK_STUCK_RECOVERY_SEC = 7.0
+# Mature dock-return wall-stall watchdog.  When the map is MATURE and the robot
+# should be heading home but is looping recovery/realign maneuvers against a wall
+# (chasing unreachable edge targets) without getting closer to the dock, blacklist
+# the edge target, back away from the wall and re-commit the dock route.  Unlike
+# DOCK_STUCK_* above this does NOT require near-complete coverage.
+MATURE_DOCK_STALL_WATCHDOG_ENABLED = True
+MATURE_DOCK_STALL_SEC = 28.0
+MATURE_DOCK_STALL_PROGRESS_M = 0.30
+MATURE_DOCK_STALL_ACTION_COOLDOWN_SEC = 10.0
+MATURE_DOCK_STALL_BLACKLIST_RADIUS_M = 0.80
+MATURE_DOCK_STALL_BLACKLIST_SEC = 150.0
+
+# Wall-trapped frontier watchdog (exploration phase).  When the robot oscillates
+# along a wall chasing a frontier that sits in a strip too narrow to enter (the
+# side wall is not in the forward camera FOV, so the strip never closes), first
+# do ONE look-around scan to honestly map the wall; if the frontier is still
+# trapped after that, blacklist it so the planner moves on to reachable unknown.
+WALL_TRAP_FRONTIER_WATCHDOG_ENABLED = True
+WALL_TRAP_FRONTIER_NEAR_M = 0.42
+WALL_TRAP_FRONTIER_ANCHOR_EPS_M = 0.32
+WALL_TRAP_FRONTIER_STALL_SEC = 22.0
+WALL_TRAP_FRONTIER_ACTION_COOLDOWN_SEC = 8.0
+WALL_TRAP_FRONTIER_BLACKLIST_RADIUS_M = 0.55
+WALL_TRAP_FRONTIER_BLACKLIST_SEC = 120.0
+# Zone escape: the trap signature is the ROBOT pinned in one wall column (it can
+# still drive up/down the strip and the frontier candidate can jump along the
+# wall), making no coverage progress.  Anchor on the robot column + coverage, so
+# a jumping candidate no longer resets the timer.  After a few failed actions in
+# the same zone, blacklist the whole stuck strip with a large radius so the
+# picker is forced to a far reachable region instead of hugging the wall.
+WALL_TRAP_FRONTIER_ZONE_COV_GAIN_PERCENT = 0.4
+WALL_TRAP_FRONTIER_ZONE_BLACKLIST_RADIUS_M = 1.2
+WALL_TRAP_FRONTIER_ZONE_MAX_ACTIONS = 2
 DOCK_STOP_HOLD_OWNER_SEC = 9999.0
-AUTO_LEARNED_MAP_CLEANING_ENABLED = True
+# Map-only mission: when False the robot still explores and returns to the dock,
+# but it STOPS there instead of starting the learned-map K cleaning / coverage
+# route phase.  Set False to focus purely on building the map.
+AUTO_LEARNED_MAP_CLEANING_ENABLED = False
 AUTO_MAP_COMPLETE_MIN_TIME_SEC = 118.0
 AUTO_MAP_COMPLETE_MIN_COVERAGE_PERCENT = 47.0
 AUTO_MAP_COMPLETE_STRONG_COVERAGE_PERCENT = 54.0
@@ -1519,6 +1755,8 @@ BODY_ROW_END_LATERAL_TOL_M = 0.060
 BODY_ROW_END_FRONT_SUPPORT_M = 0.22
 BODY_ROW_END_CENTER_SUPPORT_M = 0.24
 BODY_ROW_END_UPPER_SUPPORT_M = 0.30
+AUTO_SAVE_ON_DOCK_RETURN = True
+AUTO_SAVE_ON_SIM_END = True
 ROUTE_COLOR = (255, 90, 255)
 ROUTE_WAYPOINT_COLOR = (0, 210, 255)
 UNCLEANED_COLOR = (255, 225, 165)

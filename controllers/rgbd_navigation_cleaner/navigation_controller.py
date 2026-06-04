@@ -18,6 +18,7 @@ from pathlib import Path
 import math
 import time
 import heapq
+import itertools
 
 from mapping import (
     bresenham_cells as _bresenham_cells,
@@ -36,6 +37,8 @@ from recovery import decide_side_release_after_backup
 from control_arbiter import ControlOwner, OwnershipLock
 from wall_follow_controller import WallFollowConfig, WallFollowInput, compute_wall_follow_command
 from async_debug_viewer import AsyncDebugViewerClient
+from metrics_recorder import MetricsRecorder
+import ground_truth_map
 
 try:
     import cv2
@@ -121,11 +124,29 @@ try:
 except Exception:
     pass
 
+# Vertical FOV of the RGB camera, derived from the horizontal FOV and aspect.
+# Used to estimate the world height of a projected RGB-D feature so that high
+# furniture parts (chair backrest, seat, table top) above the robot are not
+# stamped as floor-level obstacles.
+try:
+    CAM_VFOV = 2.0 * math.atan(math.tan(float(RF_FOV) * 0.5) * (float(CAM_H) / max(1.0, float(CAM_W))))
+except Exception:
+    CAM_VFOV = float(RF_FOV) * (float(CAM_H) / max(1.0, float(CAM_W)))
+
 inertial_unit = robot.getDevice("inertial_unit")
 if inertial_unit is not None:
     inertial_unit.enable(timestep)
 else:
     print('WARNING: InertialUnit "inertial_unit" not found; falling back to pure wheel odometry heading.')
+
+# Ground-truth GPS for localization-accuracy metrics only (never used by
+# navigation/mapping).  Optional: if the world has no GPS, metrics simply skip
+# the localization-error fields.
+gt_gps = robot.getDevice("gt_gps")
+if gt_gps is not None:
+    gt_gps.enable(timestep)
+else:
+    print('NOTE: GPS "gt_gps" not found; localization-error metrics disabled (add a GPS node to the robot to enable).')
 
 front_left_bumper = robot.getDevice("front_left_bumper")
 front_center_bumper = robot.getDevice("front_center_bumper")
@@ -143,8 +164,22 @@ for bumper_name, bumper in (
 out_dir = Path(__file__).resolve().parent
 frames_dir = out_dir / "camera_frames"
 maps_dir = out_dir / "maps"
+metrics_dir = out_dir / METRICS_DIR_NAME
 frames_dir.mkdir(exist_ok=True)
 maps_dir.mkdir(exist_ok=True)
+metrics_dir.mkdir(exist_ok=True)
+metrics_session_name = f"metrics_{int(time.time())}"
+metrics_recorder = MetricsRecorder(metrics_dir, metrics_session_name, enabled=METRICS_ENABLED)
+metrics_last_sample_time = -999.0
+metrics_last_heavy_sample_time = -999.0
+metrics_last_autoexport_time = -999.0
+metrics_path_length_m = 0.0
+metrics_prev_pose = None
+metrics_gps_origin = None
+metrics_odom_origin = None
+metrics_gt_grid = None
+metrics_gt_debug = "gt=init"
+metrics_last_debug = "metrics=init"
 
 
 pose_x = 0.0
@@ -481,10 +516,14 @@ last_commit_type_debug = "commitType=none"
 last_objective_noise_filter_debug = "noise off"
 last_raw_map_speckle_debug = "rawNoise=idle"
 last_furniture_zone_debug = "furnitureZone=init"
+last_leg_quad_debug = "legQuad=init"
+last_wall_line_debug = "wallLine=init"
 last_planning_layer_debug = "planningMap=init"
 furniture_zone_core_cache = None
 furniture_zone_inflated_cache = None
 furniture_zone_cache_step = -999999
+leg_quad_last_step = -999999
+wall_line_last_step = -999999
 last_perf_debug = "perf startup"
 last_perf_loop_ms = 0.0
 last_planner_update_step = -999999
@@ -525,6 +564,10 @@ frontier_only_stall_theta = 0.0
 frontier_only_stall_blacklists = 0
 frontier_only_last_blacklist_time = -999.0
 frontier_only_last_stall_debug = "stall=idle"
+frontier_only_stall_best_cov = -1.0
+frontier_only_stall_best_cov_time = -999.0
+last_obs_boundary_cells = 0
+last_obs_boundary_debug = "obsBoundary=init"
 frontier_direct_last_unsafe_recovery_at = -999.0
 frontier_direct_last_unsafe_recovery_debug = "unsafeRecovery=idle"
 post_turn_rgbd_snapshot_until = -999.0
@@ -605,6 +648,17 @@ auto_map_return_to_dock_active = False
 auto_map_cleaning_started = False
 auto_map_final_dock_requested = False
 auto_map_ready_best_coverage = -1.0
+dock_stall_best_dist = float("inf")
+dock_stall_best_time = -999.0
+dock_stall_last_action_time = -999.0
+last_dock_stall_debug = "dockStall=init"
+wall_trap_anchor = None
+wall_trap_anchor_cov = 0.0
+wall_trap_zone_actions = 0
+wall_trap_since = -999.0
+wall_trap_last_action_time = -999.0
+wall_trap_scanned = []
+last_wall_trap_debug = "wallTrap=init"
 auto_map_ready_best_time = -999.0
 auto_map_ready_debug = "autoMap=init"
 learned_map_sanitized_once = False
@@ -620,6 +674,9 @@ last_frontier_cells = 0
 last_gray_gap_cells = 0
 last_gray_gap_components = 0
 last_gray_gap_debug = "grayGap=init"
+last_completion_gap_cells = 0
+last_completion_gap_components = 0
+last_completion_gap_debug = "completion=init"
 last_uncleaned_cells = 0
 last_footprint_clearance_m = 0.0
 last_footprint_route_blocked = 0
@@ -810,6 +867,8 @@ def hybrid_local_mapping_active(cov=None):
         c = float(last_coverage_percent if cov is None else cov)
     except Exception:
         c = 100.0
+    if completion_priority_active() and c >= float(COMPLETION_PRIORITY_FORCE_ROUTE_COVERAGE_PERCENT):
+        return False
     return bool(matrix_first_explore_active() and c < float(EXPLORATION_FRONTIER_ONLY_MIN_COVERAGE_PERCENT))
 
 def frontier_direct_mapping_safe(front, center, body_clearance):
@@ -1006,6 +1065,8 @@ def mapping_update_cadences():
         "under": effective_under_update_steps(),
         "struct": effective_structural_update_steps(),
         "noise": effective_planner_update_steps(max(1, int(RAW_MAP_SPECKLE_CLEANUP_STEPS))),
+        "legquad": effective_planner_update_steps(max(1, int(FURNITURE_LEG_QUAD_UPDATE_STEPS))),
+        "wallline": effective_planner_update_steps(max(1, int(WALL_LINE_DENOISE_UPDATE_STEPS))),
     }
 
 
@@ -1039,8 +1100,14 @@ def run_mapping_stage(pose, frame, depth):
     if STRUCTURAL_OBSTACLE_MEMORY_ENABLED and task_due(cadence["struct"]):
         profiled_call("struct", update_structural_obstacle_memory)
 
+    if FURNITURE_LEG_QUAD_ENABLED and task_due(cadence["legquad"]):
+        profiled_call("legquad", update_leg_quad_fitting)
+
     if RAW_MAP_SPECKLE_CLEANUP_ENABLED and task_due(cadence["noise"]):
         profiled_call("noise", cleanup_raw_map_speckles)
+
+    if WALL_LINE_DENOISE_ENABLED and task_due(cadence["wallline"]):
+        profiled_call("wallline", update_wall_line_denoise)
 
     return hit_count, cv_hit_count, under_marked
 
@@ -1186,6 +1253,8 @@ def handle_window_key(key):
     key_actions = {
         ord('s'): save_map,
         ord('S'): save_map,
+        ord('m'): lambda: export_metrics_summary('key'),
+        ord('M'): lambda: export_metrics_summary('key'),
         ord('r'): reset_map,
         ord('R'): reset_map,
         ord('+'): lambda: set_map_zoom(MAP_VIEW_ZOOM_STEP),
@@ -1289,8 +1358,8 @@ def compact_debug_status_line():
         f"frontier={last_frontier_cells} {last_gray_gap_debug[:26]} {last_exploration_cleanup_lock_debug[:34]} "
         f"{runtime_arena_guard_debug[:24]} {odom_arena_clamp_debug[:22]} {frontier_route_abort_hold_debug[:24]} "
         f"{last_hypothesis_obstacle_debug[:28]} {last_near_collision_hypothesis_debug[:22]} {last_low_obstacle_memory_debug[:22]} "
-        f"plan={last_planning_layer_debug[:34]} "
-        f"scan={last_active_scan_debug[:28]} gate={last_frontier_only_gate_debug[:30]} occ={last_rgbd_occlusion_debug[:18]} {last_debug_viewer_status[:22]} {last_render_throttle_debug[:18]} {load_shedding_debug_text()[:24]}"
+        f"{last_leg_quad_debug[:32]} {last_wall_line_debug[:30]} plan={last_planning_layer_debug[:34]} "
+        f"scan={last_active_scan_debug[:28]} gate={last_frontier_only_gate_debug[:30]} occ={last_rgbd_occlusion_debug[:18]} {last_debug_viewer_status[:22]} {last_render_throttle_debug[:18]} {load_shedding_debug_text()[:24]} {metrics_last_debug[:22]} {last_dock_stall_debug[:24]} {last_wall_trap_debug[:26]}"
     )
 
 
@@ -1310,6 +1379,7 @@ def verbose_debug_status_line():
         f"scan={last_active_scan_debug}, gate={last_frontier_only_gate_debug}, "
         f"arena={runtime_arena_guard_debug}, odom={odom_arena_clamp_debug}, hold={frontier_route_abort_hold_debug}, "
         f"hyp={last_hypothesis_obstacle_debug}, near={last_near_collision_hypothesis_debug}, low={last_low_obstacle_memory_debug}, "
+        f"legQuad={last_leg_quad_debug}, wallLine={last_wall_line_debug}, "
         f"occ={last_rgbd_occlusion_debug}, {last_debug_viewer_status}, {last_render_throttle_debug}, {load_shedding_debug_text()}, {last_perf_debug}"
     )
 
@@ -4038,7 +4108,18 @@ def clear_contact_evidence_cell(mx, my, delta=CONTACT_FREE_UPDATE):
     place as empty.
     """
     if map_inside(mx, my) and contact_log_odds[my, mx] > 0.0:
-        contact_log_odds[my, mx] = clamp(contact_log_odds[my, mx] + delta, CONTACT_MIN, CONTACT_MAX)
+        d = float(delta)
+        # Bumper contact is physical proof; depth can miss LOW objects that pass
+        # under the forward FOV.  While the contact is still strongly confirmed,
+        # clear it much more slowly so a hit low object is not erased by a few
+        # "free" depth frames before the planner routes around it.
+        if (
+            CONTACT_DEPTH_CLEAR_PROTECT_ENABLED
+            and d < 0.0
+            and contact_log_odds[my, mx] > float(CONTACT_DEPTH_CLEAR_PROTECT_EPS)
+        ):
+            d *= float(CONTACT_DEPTH_CLEAR_PROTECT_FACTOR)
+        contact_log_odds[my, mx] = clamp(contact_log_odds[my, mx] + d, CONTACT_MIN, CONTACT_MAX)
 
 
 def clear_contact_evidence_along_ray(x0, y0, x1, y1, delta=CONTACT_FREE_UPDATE):
@@ -4330,6 +4411,352 @@ def update_furniture_zone_cache(force=False):
 
 def furniture_zone_masks():
     return update_furniture_zone_cache(force=False)
+
+
+# ---------------------------------------------------------------------------
+# Leg-quad structural fitting
+# ---------------------------------------------------------------------------
+
+def _cluster_leg_pts(pts, max_dist_px):
+    """BFS single-linkage clustering of map-pixel (x, y) points."""
+    n = len(pts)
+    visited = [False] * n
+    groups = []
+    max_d2 = max_dist_px * max_dist_px
+    for start in range(n):
+        if visited[start]:
+            continue
+        group = [start]
+        visited[start] = True
+        queue = [start]
+        while queue:
+            cur = queue.pop()
+            cx, cy = pts[cur]
+            for j in range(n):
+                if not visited[j]:
+                    dx = cx - pts[j][0]
+                    dy = cy - pts[j][1]
+                    if dx * dx + dy * dy <= max_d2:
+                        visited[j] = True
+                        group.append(j)
+                        queue.append(j)
+        groups.append([pts[k] for k in group])
+    return groups
+
+
+def _fit_axis_aligned_rect_to_legs(pts_list):
+    """Fit an axis-aligned rectangle to >=3 real leg centroid positions.
+
+    Two points can NOT define a rectangle: an axis-aligned bbox of any pair
+    always places both points in opposite corners (quality==1 trivially) and
+    then invents two phantom corners in empty space.  That produced "legs in
+    random places".  We therefore require at least 3 real legs, and a corner is
+    only accepted as a leg if a real candidate sits within snap tolerance.  At
+    most FURNITURE_LEG_QUAD_MAX_INFERRED_CORNERS corner may be reconstructed
+    (the genuinely missing 4th leg of a rectangle).
+
+    Returns (corners_4x2_float32, quality) or (None, 0.0).
+    corners order: [TL, TR, BL, BR].  quality ∈ [0, 1].
+    """
+    pts = np.array(pts_list[:8], dtype=np.float32)
+    n = len(pts)
+    if n < 3:
+        return None, 0.0
+
+    min_span = float(FURNITURE_LEG_QUAD_MIN_SPAN_M) * float(MAP_SCALE)
+    max_span = float(FURNITURE_LEG_QUAD_MAX_SPAN_M) * float(MAP_SCALE)
+    snap_tol_frac = float(FURNITURE_LEG_QUAD_SNAP_TOL_FRAC)
+    max_inferred = int(FURNITURE_LEG_QUAD_MAX_INFERRED_CORNERS)
+
+    best_corners = None
+    best_quality = 0.0
+
+    # Try 4-point fits first, then 3-point fits; never 2 (see docstring).
+    for k in range(min(n, 4), 2, -1):
+        for subset_idx in itertools.combinations(range(n), k):
+            sub = pts[list(subset_idx)]
+            xl = float(sub[:, 0].min())
+            xr = float(sub[:, 0].max())
+            yt = float(sub[:, 1].min())
+            yb = float(sub[:, 1].max())
+            dx = xr - xl
+            dy = yb - yt
+            if dx < min_span or dy < min_span:
+                continue
+            if dx > max_span or dy > max_span:
+                continue
+            # Size gate: the rectangle must match a known furniture footprint,
+            # otherwise it is a mix of legs from different pieces (e.g. 2 chair
+            # legs + 1 table leg grouped together).
+            if FURNITURE_LEG_QUAD_EXPECTED_SIZES_M:
+                side_long = max(dx, dy) / float(MAP_SCALE)
+                side_short = min(dx, dy) / float(MAP_SCALE)
+                size_tol = float(FURNITURE_LEG_QUAD_SIZE_TOL_M)
+                size_ok = False
+                for (sa, sb) in FURNITURE_LEG_QUAD_EXPECTED_SIZES_M:
+                    el = max(float(sa), float(sb))
+                    es = min(float(sa), float(sb))
+                    if abs(side_long - el) <= size_tol and abs(side_short - es) <= size_tol:
+                        size_ok = True
+                        break
+                if not size_ok:
+                    continue
+            corners = np.array(
+                [[xl, yt], [xr, yt], [xl, yb], [xr, yb]], dtype=np.float32
+            )
+            snap_tol = max(dx, dy) * snap_tol_frac
+            # Count corners actually backed by a real leg candidate.
+            supported = 0
+            q_sum = 0.0
+            for c in corners:
+                dmin = float(np.linalg.norm(sub - c, axis=1).min())
+                if dmin <= snap_tol:
+                    supported += 1
+                    q_sum += max(0.0, 1.0 - dmin / max(1.0, snap_tol))
+            inferred = 4 - supported
+            if supported < 3 or inferred > max_inferred:
+                continue
+            # Divide by 4 so a missing corner costs quality (3/4 supported ~0.75).
+            q = q_sum / 4.0
+            if q > best_quality:
+                best_quality = q
+                best_corners = corners
+        if best_quality >= float(FURNITURE_LEG_QUAD_MIN_QUALITY):
+            break  # found a sufficient fit at this subset size
+
+    return best_corners, best_quality
+
+
+def _stamp_leg_quad(corners_px):
+    """Boost structural_log_odds at the 4 fitted rectangle corners."""
+    r_px = max(1, int(round(float(FURNITURE_LEG_QUAD_FILL_RADIUS_M) * float(MAP_SCALE))))
+    score = float(FURNITURE_LEG_QUAD_PROMOTE_SCORE)
+    smax = float(STRUCTURAL_MAX)
+    count = 0
+    for corner in corners_px:
+        cmx = int(round(float(corner[0])))
+        cmy = int(round(float(corner[1])))
+        for dy in range(-r_px, r_px + 1):
+            for dx in range(-r_px, r_px + 1):
+                if dx * dx + dy * dy <= r_px * r_px:
+                    px, py = cmx + dx, cmy + dy
+                    if map_inside(px, py):
+                        structural_log_odds[py, px] = min(
+                            smax, structural_log_odds[py, px] + score
+                        )
+                        count += 1
+    return count
+
+
+def update_leg_quad_fitting():
+    """Detect individual leg clusters, fit axis-aligned rectangles, stamp missing legs.
+
+    Finds small compact obstacle clusters (individual furniture legs), groups them
+    spatially, attempts to fit a rectangle to each group, then promotes the 4
+    inferred corner positions into structural_log_odds.  Requires at least
+    FURNITURE_LEG_QUAD_MIN_LEGS real detected clusters before snapping anything.
+    """
+    global structural_log_odds, leg_quad_last_step, last_leg_quad_debug
+    if not FURNITURE_LEG_QUAD_ENABLED:
+        last_leg_quad_debug = "legQuad=off"
+        return 0
+    if not STRUCTURAL_OBSTACLE_MEMORY_ENABLED:
+        last_leg_quad_debug = "legQuad=noStruct"
+        return 0
+    if int(step_id) - int(leg_quad_last_step) < int(FURNITURE_LEG_QUAD_UPDATE_STEPS):
+        return 0
+    leg_quad_last_step = int(step_id)
+    try:
+        obs = base_physical_obstacle_mask().astype(np.uint8)
+        # Remove isolated single-pixel noise while preserving small leg clusters.
+        obs = cv2.morphologyEx(obs, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+
+        wall = arena_wall_touch_mask()
+        n_comp, labels, stats, centroids_arr = cv2.connectedComponentsWithStats(obs, 8)
+
+        min_px = int(FURNITURE_LEG_QUAD_MIN_LEG_PX)
+        max_px = int(FURNITURE_LEG_QUAD_MAX_LEG_PX)
+        max_asp = float(FURNITURE_LEG_QUAD_LEG_MAX_ASPECT)
+
+        leg_pts = []
+        for cid in range(1, int(n_comp)):
+            area = int(stats[cid, cv2.CC_STAT_AREA])
+            if area < min_px or area > max_px:
+                continue
+            w = int(stats[cid, cv2.CC_STAT_WIDTH])
+            h = int(stats[cid, cv2.CC_STAT_HEIGHT])
+            asp = max(w, h) / max(1, min(w, h))
+            if asp > max_asp:
+                continue
+            lx = int(stats[cid, cv2.CC_STAT_LEFT])
+            ly = int(stats[cid, cv2.CC_STAT_TOP])
+            # Reject border- or wall-touching components.
+            if lx <= 1 or ly <= 1 or lx + w >= MAP_SIZE - 2 or ly + h >= MAP_SIZE - 2:
+                continue
+            comp_mask = labels == cid
+            if np.any(comp_mask & wall):
+                continue
+            leg_pts.append((float(centroids_arr[cid][0]), float(centroids_arr[cid][1])))
+
+        if len(leg_pts) < int(FURNITURE_LEG_QUAD_MIN_LEGS):
+            last_leg_quad_debug = f"legQuad=0 cands={len(leg_pts)}"
+            return 0
+
+        max_dist_px = float(FURNITURE_LEG_QUAD_MAX_SPAN_M) * float(MAP_SCALE)
+        groups = _cluster_leg_pts(leg_pts, max_dist_px)
+
+        total_stamps = 0
+        groups_fitted = 0
+        for group in groups:
+            if len(group) < int(FURNITURE_LEG_QUAD_MIN_LEGS):
+                continue
+            corners, quality = _fit_axis_aligned_rect_to_legs(group)
+            if corners is None or quality < float(FURNITURE_LEG_QUAD_MIN_QUALITY):
+                continue
+            groups_fitted += 1
+            total_stamps += _stamp_leg_quad(corners)
+
+        last_leg_quad_debug = (
+            f"legQuad={groups_fitted} c={len(leg_pts)} g={len(groups)} s={total_stamps}"
+        )
+        return total_stamps
+    except Exception as exc:
+        last_leg_quad_debug = f"legQuad=err {type(exc).__name__}"
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# Wall-line denoise (straight walls; short spurs off them are noise)
+# ---------------------------------------------------------------------------
+
+def _wall_line_is_axis_aligned(x1, y1, x2, y2, angle_tol_deg):
+    """True if a segment is within angle_tol of horizontal or vertical."""
+    ang = math.degrees(math.atan2(abs(y2 - y1), abs(x2 - x1)))  # 0..90
+    return ang <= angle_tol_deg or ang >= (90.0 - angle_tol_deg)
+
+
+def update_wall_line_denoise():
+    """Erase short spurs sticking out of straight wall lines as RGB-D noise.
+
+    Walls and large obstacles are mostly straight axis-aligned lines.  Depth/RGB
+    ray artefacts often appear as short diagonal or perpendicular stubs adjacent
+    to a wall.  This detects straight wall segments with HoughLinesP, protects
+    the wall body, and decays small elongated spur components that touch the
+    wall band but are not part of the wall line.  Compact leg-sized clusters and
+    any contact/structural/furniture-confirmed cells are never erased.
+    """
+    global log_odds, visual_log_odds, wall_line_last_step, last_wall_line_debug
+    if not WALL_LINE_DENOISE_ENABLED:
+        last_wall_line_debug = "wallLine=off"
+        return 0
+    if int(step_id) - int(wall_line_last_step) < int(WALL_LINE_DENOISE_UPDATE_STEPS):
+        return 0
+    wall_line_last_step = int(step_id)
+    try:
+        obs = base_physical_obstacle_mask().astype(np.uint8)
+        if not bool(np.any(obs)):
+            last_wall_line_debug = "wallLine=none"
+            return 0
+
+        min_len = max(4, int(round(float(WALL_LINE_MIN_LENGTH_M) * float(MAP_SCALE))))
+        max_gap = max(1, int(round(float(WALL_LINE_MAX_GAP_M) * float(MAP_SCALE))))
+        lines = cv2.HoughLinesP(
+            (obs * 255).astype(np.uint8),
+            1,
+            np.pi / 180.0,
+            int(WALL_LINE_HOUGH_THRESHOLD),
+            minLineLength=min_len,
+            maxLineGap=max_gap,
+        )
+        if lines is None:
+            last_wall_line_debug = "wallLine=0lines"
+            return 0
+
+        core_half = max(1, int(round(float(WALL_LINE_CORE_HALF_WIDTH_M) * float(MAP_SCALE))))
+        angle_tol = float(WALL_LINE_ANGLE_TOL_DEG)
+        wall_core = np.zeros((MAP_SIZE, MAP_SIZE), dtype=np.uint8)
+        n_walls = 0
+        for ln in lines:
+            x1, y1, x2, y2 = (int(v) for v in ln[0])
+            if WALL_LINE_AXIS_ALIGNED_ONLY and not _wall_line_is_axis_aligned(x1, y1, x2, y2, angle_tol):
+                continue
+            cv2.line(wall_core, (x1, y1), (x2, y2), 1, thickness=2 * core_half + 1)
+            n_walls += 1
+        if n_walls == 0:
+            last_wall_line_debug = "wallLine=0axis"
+            return 0
+
+        wall_core_b = wall_core > 0
+        near_band = max(1, int(round(float(WALL_LINE_NEAR_BAND_M) * float(MAP_SCALE))))
+        kk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * near_band + 1, 2 * near_band + 1))
+        wall_near = cv2.dilate(wall_core, kk, iterations=1) > 0
+
+        # Hard evidence that must never be erased by this denoiser.
+        contact_occ = contact_log_odds > CONTACT_OCCUPIED_EPS
+        structural_strong = (
+            (structural_log_odds > STRUCTURAL_OCCUPIED_EPS)
+            if STRUCTURAL_OBSTACLE_MEMORY_ENABLED
+            else np.zeros((MAP_SIZE, MAP_SIZE), dtype=np.bool_)
+        )
+        if FURNITURE_ZONE_DETECTION_ENABLED and furniture_zone_core_cache is not None:
+            furniture_core = furniture_zone_core_cache
+        else:
+            furniture_core = np.zeros((MAP_SIZE, MAP_SIZE), dtype=np.bool_)
+        hard = contact_occ | structural_strong | furniture_core
+
+        # Cut the wall body out of the obstacle mask so that spurs physically
+        # attached to a wall become their own small components (8-connectivity
+        # would otherwise merge a stub into the wall line itself).
+        residual = obs.copy()
+        residual[wall_core_b] = 0
+
+        n, labels, stats, _cent = cv2.connectedComponentsWithStats(residual, 8)
+        remove = np.zeros((MAP_SIZE, MAP_SIZE), dtype=np.bool_)
+        spurs = 0
+        cells = 0
+        max_area = int(WALL_LINE_SPUR_MAX_AREA_PX)
+        max_len = max(2, int(round(float(WALL_LINE_SPUR_MAX_LENGTH_M) * float(MAP_SCALE))))
+        min_aspect = float(WALL_LINE_SPUR_MIN_ASPECT)
+        max_density = float(WALL_LINE_SPUR_MAX_DENSITY)
+        tiny_area = int(WALL_LINE_SPUR_TINY_AREA_PX)
+        for cid in range(1, int(n)):
+            area = int(stats[cid, cv2.CC_STAT_AREA])
+            if area <= 0 or area > max_area:
+                continue
+            w = int(stats[cid, cv2.CC_STAT_WIDTH])
+            h = int(stats[cid, cv2.CC_STAT_HEIGHT])
+            span = max(w, h)
+            if span > max_len:
+                continue
+            narrow = max(1, min(w, h))
+            aspect = span / float(narrow)
+            density = area / float(max(1, w * h))
+            # Protect compact dense leg-sized clusters.  A spur qualifies only if
+            # it is elongated (high aspect), sparse/line-like (low fill density,
+            # which catches diagonals whose bbox is near-square), or a tiny speck.
+            is_spur_shape = (aspect >= min_aspect) or (density <= max_density) or (area <= tiny_area)
+            if not is_spur_shape:
+                continue
+            comp = labels == cid
+            if bool(np.any(comp & hard)):
+                continue
+            # A spur must adjoin the wall band, otherwise it is a free-standing
+            # obstacle and out of scope for this denoiser.  After cutting the
+            # wall body, the spur's root sits in the near band beside the wall.
+            if not bool(np.any(comp & wall_near)):
+                continue
+            remove[comp] = True
+            spurs += 1
+            cells += area
+
+        if cells > 0:
+            log_odds[remove] = np.minimum(log_odds[remove], float(WALL_LINE_DENOISE_DECAY_TO))
+            visual_log_odds[remove] = np.minimum(visual_log_odds[remove], CV_DISPLAY_LIGHT_EPS * 0.25)
+        last_wall_line_debug = f"wallLine w={n_walls} spur={spurs} cells={cells}"
+        return cells
+    except Exception as exc:
+        last_wall_line_debug = f"wallLine=err {type(exc).__name__}"
+        return 0
 
 
 def _hypothesis_clear_on_free_observations():
@@ -6174,6 +6601,118 @@ def filter_frontier_noise_mask(frontier_mask, cleanable, obstacles, unknown=None
     except Exception as exc:
         return frontier_mask.astype(np.bool_), f"frNoise=err {type(exc).__name__}"
 
+
+def build_completion_gap_mask(unknown, cleanable, obstacles):
+    """Return important unobserved pockets that should be completed before dock.
+
+    This mask is deliberately used as an objective/frontier layer only.  It does
+    not modify the online occupancy map, so false positives cannot become hard
+    obstacles for navigation.  The goal is to keep visually important interior,
+    furniture-adjacent and boundary-adjacent gray gaps from being treated as
+    harmless residual frontier noise.
+    """
+    global last_completion_gap_cells, last_completion_gap_components, last_completion_gap_debug
+    if not COMPLETION_PRIORITY_ENABLED:
+        last_completion_gap_cells = 0
+        last_completion_gap_components = 0
+        last_completion_gap_debug = "completion=off"
+        return np.zeros_like(unknown, dtype=np.bool_)
+    try:
+        unk = unknown.astype(np.bool_)
+        known = cleanable.astype(np.bool_) | obstacles.astype(np.bool_)
+        if not bool(np.any(known)):
+            last_completion_gap_cells = 0
+            last_completion_gap_components = 0
+            last_completion_gap_debug = "completion=noKnown"
+            return np.zeros_like(unk, dtype=np.bool_)
+        ys, xs = np.where(known)
+        pad = max(2, int(round(float(GRAY_REVISIT_BBOX_PAD_M) * MAP_SCALE)))
+        x0 = max(0, int(xs.min()) - pad)
+        x1 = min(MAP_SIZE, int(xs.max()) + pad + 1)
+        y0 = max(0, int(ys.min()) - pad)
+        y1 = min(MAP_SIZE, int(ys.max()) + pad + 1)
+        inside = np.zeros_like(unk, dtype=np.bool_)
+        inside[y0:y1, x0:x1] = True
+        clean_r = max(2, int(round(float(COMPLETION_PRIORITY_NEAR_CLEANABLE_M) * MAP_SCALE)))
+        obs_r = max(1, int(round(float(COMPLETION_PRIORITY_OBSTACLE_NEAR_M) * MAP_SCALE)))
+        band = max(2, int(round(float(COMPLETION_PRIORITY_BOUNDARY_BAND_M) * MAP_SCALE)))
+        near_clean = cv2.dilate(cleanable.astype(np.uint8), np.ones((2 * clean_r + 1, 2 * clean_r + 1), np.uint8), iterations=1) > 0
+        near_obs = cv2.dilate(obstacles.astype(np.uint8), np.ones((2 * obs_r + 1, 2 * obs_r + 1), np.uint8), iterations=1) > 0
+        boundary_band = np.zeros_like(unk, dtype=np.bool_)
+        boundary_band[y0:min(y1, y0 + band), x0:x1] = True
+        boundary_band[max(y0, y1 - band):y1, x0:x1] = True
+        boundary_band[y0:y1, x0:min(x1, x0 + band)] = True
+        boundary_band[y0:y1, max(x0, x1 - band):x1] = True
+        # Unknown pockets close to known floor are candidates.  We keep those
+        # adjacent to furniture or to the inferred room boundary, because these
+        # are exactly the zones that looked unfinished in the debug map.
+        candidates = unk & inside & near_clean
+        if not bool(np.any(candidates)):
+            last_completion_gap_cells = 0
+            last_completion_gap_components = 0
+            last_completion_gap_debug = "completion=0"
+            return np.zeros_like(unk, dtype=np.bool_)
+        n, labels, stats, _centroids = cv2.connectedComponentsWithStats(candidates.astype(np.uint8), 8)
+        keep = np.zeros_like(unk, dtype=np.bool_)
+        kept_cells = 0
+        kept_comps = 0
+        rejected_small = 0
+        rejected_edge = 0
+        rejected_weak = 0
+        for cid in range(1, int(n)):
+            area = int(stats[cid, cv2.CC_STAT_AREA])
+            if area < int(COMPLETION_PRIORITY_MIN_COMPONENT_CELLS) or area > int(COMPLETION_PRIORITY_MAX_COMPONENT_CELLS):
+                rejected_small += 1
+                continue
+            left = int(stats[cid, cv2.CC_STAT_LEFT])
+            top = int(stats[cid, cv2.CC_STAT_TOP])
+            width = int(stats[cid, cv2.CC_STAT_WIDTH])
+            height = int(stats[cid, cv2.CC_STAT_HEIGHT])
+            if left <= 1 or top <= 1 or left + width >= MAP_SIZE - 2 or top + height >= MAP_SIZE - 2:
+                rejected_edge += 1
+                continue
+            comp = labels == cid
+            ring = (cv2.dilate(comp.astype(np.uint8), np.ones((5, 5), np.uint8), iterations=1) > 0) & (~comp)
+            clean_edge = int(np.count_nonzero(ring & cleanable))
+            obs_edge = int(np.count_nonzero(ring & near_obs))
+            boundary_edge = int(np.count_nonzero(comp & boundary_band))
+            # Keep coherent inner holes as well as furniture/boundary-adjacent
+            # gray pockets.  This avoids throwing away the left/lower-left gaps
+            # just because they touch the current known bbox.
+            useful = bool(
+                clean_edge >= int(COMPLETION_PRIORITY_MIN_CLEAN_EDGE_CELLS)
+                and (obs_edge > 0 or boundary_edge > 0 or area >= int(COMPLETION_PRIORITY_MIN_COMPONENT_CELLS) * 3)
+            )
+            if not useful:
+                rejected_weak += 1
+                continue
+            keep[comp] = True
+            kept_cells += area
+            kept_comps += 1
+        last_completion_gap_cells = int(kept_cells)
+        last_completion_gap_components = int(kept_comps)
+        last_completion_gap_debug = f"completion={kept_cells}/{kept_comps} rej={rejected_small}/{rejected_edge}/{rejected_weak}"
+        return keep.astype(np.bool_)
+    except Exception as exc:
+        last_completion_gap_cells = 0
+        last_completion_gap_components = 0
+        last_completion_gap_debug = f"completion=err {type(exc).__name__}"
+        return np.zeros_like(unknown, dtype=np.bool_)
+
+
+def completion_priority_active():
+    """True when remaining completion gaps should override local wall/frontier loops."""
+    if not COMPLETION_PRIORITY_ENABLED:
+        return False
+    try:
+        cov = float(last_coverage_percent or 0.0)
+        return bool(
+            cov >= float(COMPLETION_PRIORITY_MIN_COVERAGE_PERCENT)
+            and int(last_completion_gap_cells or 0) >= int(COMPLETION_PRIORITY_FORCE_ROUTE_CELLS)
+        )
+    except Exception:
+        return False
+
 def build_frontier_revisit_mask(unknown, cleanable, obstacles):
     """Return frontier cells biased toward reachable interior gray gaps.
 
@@ -6182,11 +6721,13 @@ def build_frontier_revisit_mask(unknown, cleanable, obstacles):
     inside the already mapped room from outside-room unknown background.
     """
     global last_gray_gap_cells, last_gray_gap_components, last_gray_gap_debug
+    global last_completion_gap_cells, last_completion_gap_components, last_completion_gap_debug
     try:
         hyp_shadow = hypothesis_obstacle_mask(force=False) if OBSTACLE_HYPOTHESIS_ENABLED else np.zeros_like(unknown, dtype=np.bool_)
         frontier_unknown = unknown & (~hyp_shadow)
         base_frontier = frontier_unknown & (cv2.dilate(cleanable.astype(np.uint8), np.ones((7, 7), np.uint8), iterations=1) > 0)
         base_frontier, frontier_noise_debug = filter_frontier_noise_mask(base_frontier, cleanable, obstacles, unknown)
+        completion_mask = build_completion_gap_mask(frontier_unknown, cleanable, obstacles)
         last_gray_gap_cells = 0
         last_gray_gap_components = 0
         if not GRAY_REVISIT_ENABLED:
@@ -6287,11 +6828,17 @@ def build_frontier_revisit_mask(unknown, cleanable, obstacles):
         dil_r = max(1, int(round(float(GRAY_REVISIT_FRONTIER_DILATE_M) * MAP_SCALE)))
         around_cleanable = cv2.dilate(cleanable.astype(np.uint8), np.ones((2 * dil_r + 1, 2 * dil_r + 1), np.uint8), iterations=1) > 0
         gap_frontier = gap_unknown & around_cleanable
-        frontier = base_frontier | gap_frontier
+        comp_frontier = completion_mask & around_cleanable
+        frontier = base_frontier | gap_frontier | comp_frontier
         frontier, frontier_noise_debug = filter_frontier_noise_mask(frontier, cleanable, obstacles, unknown)
+        cells = int(cells) + int(last_completion_gap_cells or 0)
+        comps = int(comps) + int(last_completion_gap_components or 0)
         last_gray_gap_cells = int(cells)
         last_gray_gap_components = int(comps)
-        last_gray_gap_debug = f"grayGap={int(cells)}/{int(comps)} rejE/S/O={rejected_edge}/{rejected_size}/{rejected_shadow} {frontier_noise_debug}"
+        last_gray_gap_debug = (
+            f"grayGap={int(cells)}/{int(comps)} rejE/S/O={rejected_edge}/{rejected_size}/{rejected_shadow} "
+            f"{last_completion_gap_debug} {frontier_noise_debug}"
+        )
         return frontier.astype(np.bool_)
     except Exception as exc:
         last_gray_gap_cells = 0
@@ -6302,6 +6849,65 @@ def build_frontier_revisit_mask(unknown, cleanable, obstacles):
             return ((unknown & (~hyp_shadow)) & (cv2.dilate(cleanable.astype(np.uint8), np.ones((7, 7), np.uint8), iterations=1) > 0)).astype(np.bool_)
         except Exception:
             return np.zeros_like(unknown, dtype=np.bool_)
+
+
+def build_obs_boundary_vantage_mask(obstacles, cleanable, unknown):
+    """Return cleanable cells just outside obstacle clusters that have unexplored sides.
+
+    These vantage positions give the robot line-of-sight to gray (unknown) cells
+    adjacent to obstacles — the unseen faces that never become regular frontiers
+    because the shadow-rejection filter correctly removes them from the gray-gap
+    set.  Reaching a vantage point triggers an RGBD capture that fills in the
+    obstacle silhouette without relying on accidental close passes.
+    """
+    global last_obs_boundary_cells, last_obs_boundary_debug
+    if not OBS_BOUNDARY_FRONTIER_ENABLED:
+        last_obs_boundary_debug = "obsBoundary=off"
+        last_obs_boundary_cells = 0
+        return np.zeros_like(cleanable, dtype=np.bool_)
+    try:
+        # Use stable confirmed obstacles only to avoid chasing sensor noise.
+        obs_stable = obstacles & (log_odds > float(LO_OCCUPIED_EPS) + 0.5)
+        if not np.any(obs_stable):
+            last_obs_boundary_debug = "obsBoundary=none"
+            last_obs_boundary_cells = 0
+            return np.zeros_like(cleanable, dtype=np.bool_)
+
+        approach_r = max(2, int(round(float(OBS_BOUNDARY_FRONTIER_APPROACH_M) * MAP_SCALE)))
+        k_approach = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * approach_r + 1, 2 * approach_r + 1)
+        )
+        k_adj = np.ones((5, 5), np.uint8)
+
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(
+            obs_stable.astype(np.uint8), 8
+        )
+        vantage = np.zeros_like(cleanable, dtype=np.bool_)
+        total_vantage = 0
+        clusters_used = 0
+
+        for cid in range(1, int(n)):
+            if int(stats[cid, cv2.CC_STAT_AREA]) < int(OBS_BOUNDARY_FRONTIER_MIN_CLUSTER_CELLS):
+                continue
+            comp = (labels == cid)
+            # Count unexplored gray cells directly adjacent to this cluster.
+            adj = cv2.dilate(comp.astype(np.uint8), k_adj, iterations=1) > 0
+            adj_unknown = int(np.count_nonzero(adj & unknown & ~comp))
+            if adj_unknown < int(OBS_BOUNDARY_FRONTIER_MIN_ADJACENT_UNKNOWN):
+                continue
+            # Vantage ring = approach dilation ∩ cleanable ∩ not inside cluster.
+            outer = (cv2.dilate(comp.astype(np.uint8), k_approach, iterations=1) > 0) & cleanable & ~comp
+            vantage |= outer
+            total_vantage += int(np.count_nonzero(outer))
+            clusters_used += 1
+
+        last_obs_boundary_cells = total_vantage
+        last_obs_boundary_debug = f"obsBoundary={total_vantage} clusters={clusters_used}"
+        return vantage.astype(np.bool_)
+    except Exception as exc:
+        last_obs_boundary_debug = f"obsBoundary=err {type(exc).__name__}"
+        last_obs_boundary_cells = 0
+        return np.zeros_like(cleanable, dtype=np.bool_)
 
 
 def compute_coverage_masks():
@@ -7219,6 +7825,12 @@ def exploration_mapping_snapshot_allowed():
         return False
     if map_mature or str(planner_confidence or "") == "MATURE":
         return False
+    # Never fuse a stationary snapshot while the robot is in contact recovery:
+    # it sits at an oblique pose hard against an object (e.g. the low red box),
+    # so its depth rays smear a fan of bad geometry into the map and corrupt
+    # localization.  Let the robot escape the contact first.
+    if nav_state in CONTACT_RECOVERY_STATES:
+        return False
     return True
 
 
@@ -7550,7 +8162,8 @@ def active_rgbd_scan_need(front, body_clearance):
         except Exception:
             pass
     tile_key = active_scan_tile_key()
-    if active_scan_area_suppressed(now, tile_key):
+    completion_scan_force = completion_priority_active()
+    if active_scan_area_suppressed(now, tile_key) and not completion_scan_force:
         return False, "area cooldown"
     if last_bumper_left or last_bumper_center or last_bumper_right:
         last_active_scan_debug = "scan=skip bumper"
@@ -7559,7 +8172,7 @@ def active_rgbd_scan_need(front, body_clearance):
         last_active_scan_debug = f"scan=skip unsafe F={front:.2f} body={body_clearance:.2f}"
         return False, "unsafe clearance"
     moved_since = math.hypot(pose_x - active_scan_last_x, pose_y - active_scan_last_y)
-    if now - active_scan_last_completed_at < ACTIVE_SCAN_COOLDOWN_SEC and moved_since < ACTIVE_SCAN_SPATIAL_COOLDOWN_M:
+    if now - active_scan_last_completed_at < ACTIVE_SCAN_COOLDOWN_SEC and moved_since < ACTIVE_SCAN_SPATIAL_COOLDOWN_M and not completion_scan_force:
         last_active_scan_debug = f"scan=cooldown {now-active_scan_last_completed_at:.1f}s d={moved_since:.2f}"
         return False, "cooldown"
     try:
@@ -7590,6 +8203,7 @@ def frontier_only_stall_watchdog_update(route_present, route_reason, safe_snapsh
     """Return an action string for frontier-only deadlock recovery."""
     global frontier_only_stall_since, frontier_only_stall_x, frontier_only_stall_y, frontier_only_stall_theta
     global frontier_only_stall_blacklists, frontier_only_last_blacklist_time, frontier_only_last_stall_debug
+    global frontier_only_stall_best_cov, frontier_only_stall_best_cov_time
     if not EXPLORATION_FRONTIER_ONLY_STALL_WATCHDOG_ENABLED:
         frontier_only_last_stall_debug = "stall=off"
         return "none"
@@ -7597,6 +8211,21 @@ def frontier_only_stall_watchdog_update(route_present, route_reason, safe_snapsh
         now = float(robot.getTime())
     except Exception:
         now = 0.0
+
+    # Coverage-progress stall: fires even when the robot is physically moving but
+    # map coverage has been flat.  This catches the "washing machine" loop where
+    # recovery maneuvers (CONTACT_BACKUP / GRID_REALIGN) continuously reset the
+    # pose-based stall timer while the robot bounces near a blocked frontier zone.
+    cov_f = float(cov) if cov is not None else 0.0
+    if frontier_only_stall_best_cov_time < -100.0:
+        frontier_only_stall_best_cov = cov_f
+        frontier_only_stall_best_cov_time = now
+    elif cov_f > float(frontier_only_stall_best_cov) + float(EXPLORATION_FRONTIER_ONLY_STALL_COV_GAIN_PERCENT):
+        frontier_only_stall_best_cov = cov_f
+        frontier_only_stall_best_cov_time = now
+    cov_stall_sec = max(0.0, now - float(frontier_only_stall_best_cov_time))
+    cov_stalled = cov_stall_sec >= float(EXPLORATION_FRONTIER_ONLY_STALL_COV_TIMEOUT_SEC)
+
     moved = math.hypot(float(pose_x) - float(frontier_only_stall_x), float(pose_y) - float(frontier_only_stall_y))
     turned = abs(normalize_angle(float(pose_theta) - float(frontier_only_stall_theta)))
     if (
@@ -7608,14 +8237,25 @@ def frontier_only_stall_watchdog_update(route_present, route_reason, safe_snapsh
         frontier_only_stall_x = float(pose_x)
         frontier_only_stall_y = float(pose_y)
         frontier_only_stall_theta = float(pose_theta)
-        frontier_only_last_stall_debug = "stall=reset"
-        return "none"
-    stall_sec = max(0.0, now - float(frontier_only_stall_since))
-    frontier_only_last_stall_debug = f"stall={stall_sec:.0f}s bl={frontier_only_stall_blacklists} safe={int(bool(safe_snapshot))}"
+        if not cov_stalled:
+            frontier_only_last_stall_debug = "stall=reset"
+            return "none"
+        # Robot is physically moving but coverage is frozen — fall through to
+        # blacklist logic below using the coverage-stall elapsed time.
+        stall_sec = cov_stall_sec
+        frontier_only_last_stall_debug = f"stall=covFlat {cov_stall_sec:.0f}s cov={cov_f:.1f} bl={frontier_only_stall_blacklists}"
+    else:
+        stall_sec = max(0.0, now - float(frontier_only_stall_since))
+        if cov_stalled:
+            stall_sec = max(stall_sec, cov_stall_sec)
+        frontier_only_last_stall_debug = f"stall={stall_sec:.0f}s bl={frontier_only_stall_blacklists} safe={int(bool(safe_snapshot))}"
     if stall_sec < float(EXPLORATION_FRONTIER_ONLY_STALL_TIMEOUT_SEC):
         return "none"
     # If a long sequence of unreachable local frontiers produces no map progress,
     # stop chasing gray/obstacle-shadow pockets and go to dock for learned K-clean.
+    remaining_completion = int(last_completion_gap_cells or 0)
+    remaining_gray = int(last_gray_gap_cells or 0)
+    remaining_frontier = int(last_frontier_cells or 0)
     if (
         float(cov) >= float(EXPLORATION_FRONTIER_ONLY_STALL_RETURN_MIN_COVERAGE_PERCENT)
         and (
@@ -7623,8 +8263,18 @@ def frontier_only_stall_watchdog_update(route_present, route_reason, safe_snapsh
             or frontier_only_stall_blacklists >= int(EXPLORATION_FRONTIER_ONLY_STALL_MAX_BLACKLISTS_BEFORE_DOCK)
         )
     ):
-        frontier_only_last_stall_debug = f"stall=dock {stall_sec:.0f}s cov={cov:.1f} bl={frontier_only_stall_blacklists}"
-        return "dock"
+        if (
+            remaining_completion >= int(COMPLETION_PRIORITY_STALL_DOCK_BLOCK_CELLS)
+            or remaining_gray >= int(RIGHT_WALL_REPEAT_SUPPRESS_MIN_GRAY_CELLS)
+            or remaining_frontier >= int(EXPLORATION_FRONTIER_ONLY_MIN_FRONTIER_CELLS) * 4
+        ):
+            frontier_only_last_stall_debug = (
+                f"stall=noDock {stall_sec:.0f}s cov={cov:.1f} "
+                f"fr={remaining_frontier} gray={remaining_gray} comp={remaining_completion} bl={frontier_only_stall_blacklists}"
+            )
+        else:
+            frontier_only_last_stall_debug = f"stall=dock {stall_sec:.0f}s cov={cov:.1f} bl={frontier_only_stall_blacklists}"
+            return "dock"
     # Otherwise suppress the current frontier viewpoint/component and force the
     # planner to search a different vantage point.
     if now - float(frontier_only_last_blacklist_time) >= max(2.0, float(EXPLORATION_FRONTIER_ONLY_STALL_TIMEOUT_SEC) * 0.65):
@@ -7647,6 +8297,8 @@ def frontier_only_stall_watchdog_update(route_present, route_reason, safe_snapsh
                 frontier_only_stall_x = float(pose_x)
                 frontier_only_stall_y = float(pose_y)
                 frontier_only_stall_theta = float(pose_theta)
+                frontier_only_stall_best_cov = cov_f
+                frontier_only_stall_best_cov_time = now
                 frontier_only_last_stall_debug = f"stall=blacklist {int(gx)},{int(gy)} bl={frontier_only_stall_blacklists}"
                 return "blacklist"
         except Exception as exc:
@@ -7702,6 +8354,39 @@ def exploration_frontier_only_owner_gate(front, center, body_clearance, left=Non
     # row controller keep moving and collect more RGB-D evidence instead of holding
     # owner=NONE on a noisy/shadow frontier.
     if hybrid_local_mapping_active(cov):
+        # Short-route exception: if a nearby frontier route is already computed
+        # and passes all safety checks, commit it rather than ignoring it.
+        # Without this, the robot can see the frontier target on the map but
+        # keeps driving in the wrong direction because the gate returns False
+        # before ever reaching the route-commit check below.
+        if EXPLORATION_FRONTIER_HYBRID_SHORT_COMMIT_ENABLED and FRONTIER_DIRECT_MAPPING_HOLD_IF_ROUTE_OK:
+            try:
+                route_cost_val = float(coverage_route_cost)
+            except Exception:
+                route_cost_val = 99.0
+            if (
+                math.isfinite(route_cost_val)
+                and route_cost_val <= float(EXPLORATION_FRONTIER_HYBRID_SHORT_COMMIT_MAX_COST_M)
+                and coverage_route_kind == "frontier"
+                and coverage_goal_kind == "frontier"
+                and coverage_goal_map is not None
+                and coverage_route_map
+            ):
+                try:
+                    short_ok, short_reason = coverage_candidate_is_committable(front, center, body_clearance)
+                except Exception as exc:
+                    short_ok, short_reason = False, f"hybrid-short err {type(exc).__name__}"
+                if short_ok:
+                    try:
+                        if str(control_lock.owner) == ControlOwner.ROW_FORWARD.value:
+                            release_control("hybrid-row short frontier will own")
+                    except Exception:
+                        pass
+                    last_frontier_only_gate_debug = (
+                        f"frontierGate=hybrid-short cost={route_cost_val:.2f} cov={cov:.1f}"
+                    )
+                    last_planner_update_step = -999999
+                    return True
         last_frontier_only_gate_debug = f"frontierGate=hybrid-row cov={cov:.1f}/{EXPLORATION_FRONTIER_ONLY_MIN_COVERAGE_PERCENT:.1f}"
         return False
 
@@ -7803,6 +8488,21 @@ def exploration_frontier_only_owner_gate(front, center, body_clearance, left=Non
         last_frontier_only_gate_debug = f"frontierGate=snapshot fr={frontiers} cov={cov:.1f}"
         last_planner_update_step = -999999
         return True
+
+    # Anti-freeze: if we have held owner=NONE on a stationary robot for a while
+    # (frontier route present but never committable, snapshots on cooldown), do
+    # NOT keep the robot standing still ("lost control").  Hand motion back to
+    # ROW_FORWARD so it drives, gathers RGB-D evidence and leaves the dead spot;
+    # the stall watchdog above still escalates to blacklist/dock independently.
+    try:
+        hold_stall_sec = (now - float(frontier_only_stall_since)) if frontier_only_stall_since > -100.0 else 0.0
+    except Exception:
+        hold_stall_sec = 0.0
+    if hold_stall_sec >= float(EXPLORATION_FRONTIER_ONLY_HOLD_RELEASE_SEC):
+        coverage_status = f"frontier-only hold-release -> row: stuck {hold_stall_sec:.0f}s fr={frontiers}"
+        last_optional_block_reason = "frontier-only hold too long -> let ROW_FORWARD drive"
+        last_frontier_only_gate_debug = f"frontierGate=holdRelease {hold_stall_sec:.0f}s->row"
+        return False
 
     coverage_status = f"frontier-only hold: {str(route_reason)[:52]} fr={frontiers} cov={cov:.1f}"
     last_optional_block_reason = "frontier-only blocks ROW_FORWARD"
@@ -8529,6 +9229,17 @@ def plan_best_coverage_route(obstacles, cleanable, cleaned, uncleaned, unknown, 
     frontier_radius_px = max(1, int(EXPLORE_FRONTIER_VANTAGE_RADIUS_M * MAP_SCALE))
     frontier_integral = cv2.integral(frontier.astype(np.uint8))
     unknown_integral = cv2.integral(unknown.astype(np.uint8))
+    obs_boundary = build_obs_boundary_vantage_mask(obstacles, cleanable, unknown)
+    obs_boundary_integral = cv2.integral(obs_boundary.astype(np.uint8))
+    completion_mask = build_completion_gap_mask(unknown, cleanable, obstacles) if COMPLETION_PRIORITY_ENABLED else np.zeros_like(frontier, dtype=np.bool_)
+    completion_integral = cv2.integral(completion_mask.astype(np.uint8))
+    try:
+        known_for_wall = cleanable.astype(np.bool_) | actual_obstacles.astype(np.bool_)
+        _wall_ys, wall_xs = np.where(known_for_wall)
+        known_right_x = int(wall_xs.max()) if wall_xs.size else MAP_SIZE - 1
+    except Exception:
+        known_right_x = MAP_SIZE - 1
+    right_wall_band_px = max(2, int(round(float(RIGHT_WALL_REPEAT_SUPPRESS_EDGE_BAND_M) * MAP_SCALE)))
     frontier_component_labels = np.zeros_like(frontier, dtype=np.int32)
     frontier_component_sizes = np.zeros(1, dtype=np.int32)
     try:
@@ -8556,6 +9267,7 @@ def plan_best_coverage_route(obstacles, cleanable, cleaned, uncleaned, unknown, 
     coarse_frontier_local_cells = np.zeros((gh, gw), dtype=np.int32)
     coarse_frontier_component_cells = np.zeros((gh, gw), dtype=np.int32)
     coarse_frontier_unknown_cells = np.zeros((gh, gw), dtype=np.int32)
+    coarse_completion_cells = np.zeros((gh, gw), dtype=np.int32)
 
     for gy in range(gh):
         py0 = y0 + gy * step
@@ -8604,9 +9316,17 @@ def plan_best_coverage_route(obstacles, cleanable, cleaned, uncleaned, unknown, 
                     if ids.size > 0:
                         frontier_component_cells = int(np.max(frontier_component_sizes[ids]))
             unknown_local_cells = integral_rect_count(unknown_integral, cx, cy, frontier_radius_px)
+            obs_boundary_local = integral_rect_count(obs_boundary_integral, cx, cy, frontier_radius_px)
+            completion_local = integral_rect_count(
+                completion_integral,
+                cx,
+                cy,
+                max(frontier_radius_px, int(round(float(COMPLETION_PRIORITY_LOCAL_RADIUS_M) * MAP_SCALE))),
+            )
             coarse_frontier_local_cells[gy, gx] = int(front_local_cells)
             coarse_frontier_component_cells[gy, gx] = int(frontier_component_cells)
             coarse_frontier_unknown_cells[gy, gx] = int(unknown_local_cells)
+            coarse_completion_cells[gy, gx] = int(completion_local)
             fp_gain_cells = int(footprint_gain_count[cy, cx]) if map_inside(cx, cy) else 0
             fp_gain_ratio = float(footprint_gain_ratio[cy, cx]) if map_inside(cx, cy) else 0.0
             fp_reclean_ratio = float(footprint_reclean_ratio[cy, cx]) if map_inside(cx, cy) else 1.0
@@ -8628,20 +9348,40 @@ def plan_best_coverage_route(obstacles, cleanable, cleaned, uncleaned, unknown, 
                     or front_local_cells >= EXPLORE_FRONTIER_VANTAGE_MIN_LOCAL_CELLS
                 )
             )
+            obs_boundary_vantage = bool(
+                explore_priority
+                and OBS_BOUNDARY_FRONTIER_ENABLED
+                and obs_boundary_local >= int(OBS_BOUNDARY_FRONTIER_MIN_LOCAL_CELLS)
+                and float(last_coverage_percent or 0.0) >= float(OBS_BOUNDARY_FRONTIER_MIN_COVERAGE_PERCENT)
+            )
             if frontier_vantage:
                 target_kind[gy, gx] = 2
                 fwd = longitudinal / max(dist, 1e-6)
                 local_frontier_bonus = min(EXPLORE_FRONTIER_LOCAL_BONUS_MAX, EXPLORE_FRONTIER_LOCAL_BONUS_SCALE * float(front_local_cells))
                 component_frontier_bonus = min(EXPLORE_FRONTIER_COMPONENT_BONUS_MAX, EXPLORE_FRONTIER_COMPONENT_BONUS_SCALE * float(frontier_component_cells))
                 open_area_bonus = min(EXPLORE_FRONTIER_OPEN_AREA_BONUS_MAX, EXPLORE_FRONTIER_OPEN_AREA_BONUS_SCALE * float(unknown_local_cells))
+                completion_bonus = 0.0
+                if completion_local >= int(COMPLETION_PRIORITY_MIN_LOCAL_CELLS):
+                    completion_bonus = (
+                        float(COMPLETION_PRIORITY_REWARD)
+                        + min(float(COMPLETION_PRIORITY_LOCAL_BONUS_MAX), float(COMPLETION_PRIORITY_LOCAL_BONUS_SCALE) * float(completion_local))
+                    )
                 target_reward[gy, gx] = (
                     EXPLORE_FRONTIER_REWARD
                     + EXPLORE_FRONTIER_RATIO_REWARD * max(front_ratio, min(0.60, float(front_local_cells) / max(1.0, float(area))))
                     + local_frontier_bonus
                     + component_frontier_bonus
                     + open_area_bonus
+                    + completion_bonus
                     + 2.0 * max(0.0, fwd)
                 )
+            elif obs_boundary_vantage:
+                target_kind[gy, gx] = 4
+                obs_bonus = min(
+                    float(OBS_BOUNDARY_FRONTIER_BONUS_MAX),
+                    float(OBS_BOUNDARY_FRONTIER_BONUS_SCALE) * float(obs_boundary_local),
+                )
+                target_reward[gy, gx] = float(OBS_BOUNDARY_FRONTIER_REWARD) + obs_bonus
             elif (not cleanup_locked) and under_ratio >= GLOBAL_ROUTE_TARGET_UNDER_RATIO and dist <= GLOBAL_ROUTE_UNDER_MAX_DIST_M and under_direct:
                 # Keep under-furniture cleanup opportunistic. It may win only when
                 # the robot is already near and lined up with the opening. Without
@@ -8676,7 +9416,10 @@ def plan_best_coverage_route(obstacles, cleanable, cleaned, uncleaned, unknown, 
                 target_kind[gy, gx] = 2
                 local_frontier_bonus = min(EXPLORE_FRONTIER_LOCAL_BONUS_MAX * 0.55, EXPLORE_FRONTIER_LOCAL_BONUS_SCALE * float(front_local_cells))
                 component_frontier_bonus = min(EXPLORE_FRONTIER_COMPONENT_BONUS_MAX * 0.45, EXPLORE_FRONTIER_COMPONENT_BONUS_SCALE * float(frontier_component_cells))
-                target_reward[gy, gx] = 7.0 + 6.0 * front_ratio + local_frontier_bonus + component_frontier_bonus
+                completion_bonus = 0.0
+                if completion_local >= int(COMPLETION_PRIORITY_MIN_LOCAL_CELLS):
+                    completion_bonus = min(float(COMPLETION_PRIORITY_LOCAL_BONUS_MAX), float(COMPLETION_PRIORITY_LOCAL_BONUS_SCALE) * float(completion_local))
+                target_reward[gy, gx] = 7.0 + 6.0 * front_ratio + local_frontier_bonus + component_frontier_bonus + completion_bonus
 
     # present near a wall/obstacle boundary, allow it into the component scorer
     # even when normal partial-map gates would have treated it as residual noise.
@@ -9086,6 +9829,32 @@ def plan_best_coverage_route(obstacles, cleanable, cleaned, uncleaned, unknown, 
             local_first_bonus = 0.0
             local_first_penalty = 0.0
             local_first_debug = "localFirst=off"
+            completion_route_bonus = 0.0
+            wall_repeat_penalty = 0.0
+            try:
+                completion_cells_dbg = int(coarse_completion_cells[gy, gx])
+            except Exception:
+                completion_cells_dbg = 0
+            if completion_cells_dbg >= int(COMPLETION_PRIORITY_MIN_LOCAL_CELLS):
+                completion_route_bonus = min(
+                    float(COMPLETION_PRIORITY_LOCAL_BONUS_MAX),
+                    float(COMPLETION_PRIORITY_LOCAL_BONUS_SCALE) * float(completion_cells_dbg),
+                )
+            try:
+                right_wall_target = bool(
+                    RIGHT_WALL_REPEAT_SUPPRESS_ENABLED
+                    and float(last_coverage_percent or 0.0) >= float(RIGHT_WALL_REPEAT_SUPPRESS_MIN_COVERAGE_PERCENT)
+                    and int(last_gray_gap_cells or 0) >= int(RIGHT_WALL_REPEAT_SUPPRESS_MIN_GRAY_CELLS)
+                    and int(cx) >= int(known_right_x) - int(right_wall_band_px)
+                    and recent_target >= float(RIGHT_WALL_REPEAT_SUPPRESS_RECENT_RATIO)
+                    and math.hypot(float(wx) - float(pose_x), float(wy) - float(pose_y)) <= float(RIGHT_WALL_REPEAT_SUPPRESS_NEAR_ROBOT_M)
+                )
+                if right_wall_target:
+                    wall_repeat_penalty = float(RIGHT_WALL_REPEAT_SUPPRESS_PENALTY)
+                    if completion_priority_active():
+                        wall_repeat_penalty = float(RIGHT_WALL_REPEAT_SUPPRESS_WITH_COMPLETION_PENALTY)
+            except Exception:
+                wall_repeat_penalty = 0.0
             if LOCAL_FIRST_FRONTIER_ENABLED:
                 local_cells = int(front_cells_dbg) if 'front_cells_dbg' in locals() else 0
                 local_unknown = int(front_unknown_dbg) if 'front_unknown_dbg' in locals() else 0
@@ -9115,8 +9884,10 @@ def plan_best_coverage_route(obstacles, cleanable, cleaned, uncleaned, unknown, 
                     local_first_debug = f"localFirst=weak loc={local_cells} unk={local_unknown}"
             score = (
                 reward
+                + completion_route_bonus
                 + local_first_bonus
                 - local_first_penalty
+                - wall_repeat_penalty
                 - EXPLORATION_ROUTE_COST_PENALTY * route_cost_m
                 - EXPLORATION_ROUTE_TURN_PENALTY * turn_need
                 - EXPLORATION_ROUTE_LATERAL_PENALTY * lateral
@@ -9129,7 +9900,8 @@ def plan_best_coverage_route(obstacles, cleanable, cleaned, uncleaned, unknown, 
             )
             last_exploration_route_debug = (
                 f"exploreRoute=frontier-only cost={route_cost_m:.2f} d={straight_dist:.2f} "
-                f"turn={turn_need:.2f} {route_geometry_debug} {local_first_debug}"
+                f"turn={turn_need:.2f} comp={completion_cells_dbg} cb={completion_route_bonus:.1f} "
+                f"wallPen={wall_repeat_penalty:.1f} {route_geometry_debug} {local_first_debug}"
             )
         else:
             # Equivalent to the requested cost expression, now using the
@@ -9282,7 +10054,7 @@ def plan_best_coverage_route(obstacles, cleanable, cleaned, uncleaned, unknown, 
         wx = (cx - MAP_ORIGIN_X) / MAP_SCALE
         wy = (MAP_ORIGIN_Y - cy) / MAP_SCALE
     wp_map, wp_world = route_waypoint_from_path(route)
-    kind_name = {1: "uncleaned", 2: "frontier", 3: "under-surface"}.get(kind_code, "uncleaned")
+    kind_name = {1: "uncleaned", 2: "frontier", 3: "under-surface", 4: "obs-boundary"}.get(kind_code, "uncleaned")
     route_world = [((mx - MAP_ORIGIN_X) / MAP_SCALE, (MAP_ORIGIN_Y - my) / MAP_SCALE) for mx, my in route]
     last_route_planner_ms = (time.perf_counter() - planner_t0) * 1000.0
     last_route_planner_nodes = int(expanded_nodes)
@@ -9923,6 +10695,11 @@ def finish_route_commit(reason="entry reached"):
         route_abort_reason = "none"
         last_route_commit_debug = dock_return_status
         hard_stop_motors()
+        if AUTO_SAVE_ON_DOCK_RETURN:
+            try:
+                save_run_summary(f"dock_return: {dock_return_reason[:40]}")
+            except Exception:
+                pass
         acquire_control(ControlOwner.PLANNER, DOCK_STOP_HOLD_OWNER_SEC, 0.0, "docked stop")
         return
 
@@ -10128,9 +10905,10 @@ def learned_map_ready_to_clean():
     mapping; the second learned-map K pass will clean systematically from dock.
     """
     global auto_map_ready_best_coverage, auto_map_ready_best_time, auto_map_ready_debug
-    if not AUTO_LEARNED_MAP_CLEANING_ENABLED:
-        auto_map_ready_debug = "autoMap=off"
-        return False, auto_map_ready_debug
+    # Note: this readiness gate stays active even in map-only mode
+    # (AUTO_LEARNED_MAP_CLEANING_ENABLED False) so the robot still returns to the
+    # dock when the map is complete; the dock arrival then stops instead of
+    # starting the K cleaning phase (see complete_map_return_to_dock).
     if auto_map_cleaning_started or auto_map_return_to_dock_active or dock_return_active or dock_return_completed:
         auto_map_ready_debug = f"autoMap=busy phase={auto_map_mission_phase} dock={dock_return_status[:26]}"
         return False, auto_map_ready_debug
@@ -10191,6 +10969,16 @@ def learned_map_ready_to_clean():
     )
     if not gray_ok:
         auto_map_ready_debug = f"autoMap=wait gray {gray_cells}/{gray_comps} {last_gray_gap_debug[:28]}"
+        return False, auto_map_ready_debug
+
+    if (
+        int(last_completion_gap_cells or 0) >= int(COMPLETION_PRIORITY_COMPLETE_BLOCK_CELLS)
+        or int(last_completion_gap_components or 0) >= int(COMPLETION_PRIORITY_COMPLETE_BLOCK_COMPS)
+    ):
+        auto_map_ready_debug = (
+            f"autoMap=wait completion {int(last_completion_gap_cells or 0)}/"
+            f"{int(last_completion_gap_components or 0)} {last_completion_gap_debug[:36]}"
+        )
         return False, auto_map_ready_debug
 
     arena_ok, arena_dbg = learned_map_arena_exploration_gate()
@@ -10387,9 +11175,28 @@ def enable_learned_map_coverage_cleaning(reason="returned to dock"):
 
 
 def complete_map_return_to_dock(reason="map locked at dock"):
-    """Complete the intermediate dock stop and immediately switch to K cleaning."""
+    """Finish the dock return.  In map-only mode stop here; otherwise start K cleaning."""
     global dock_return_active, dock_return_completed, dock_return_status, dock_return_reason, coverage_status
+    global auto_map_return_to_dock_active, auto_map_mission_phase, planner_mode, planner_intent
     dock_return_active = False
+    if not AUTO_LEARNED_MAP_CLEANING_ENABLED:
+        # Map-only mission: park at the dock and stop.  Do not build coverage
+        # routes or start the learned-map cleaning phase.
+        dock_return_completed = True
+        auto_map_return_to_dock_active = False
+        auto_map_mission_phase = "MAP_ONLY_DONE"
+        planner_mode = "MAP_ONLY_DOCKED"
+        planner_intent = PLANNER_INTENT_FINISH_CLEANUP
+        dock_return_reason = str(reason or "map dock reached")
+        dock_return_status = f"map-only mission complete, parked at dock: {dock_return_reason[:28]}"
+        coverage_status = dock_return_status
+        hard_stop_motors()
+        try:
+            acquire_control(ControlOwner.PLANNER, DOCK_STOP_HOLD_OWNER_SEC, 0.0, "map-only docked stop")
+        except Exception:
+            pass
+        print("[MISSION] map-only complete:", dock_return_status)
+        return True
     dock_return_completed = False
     dock_return_reason = str(reason or "map dock reached")
     dock_return_status = f"dock reached for learned K: {dock_return_reason[:38]}"
@@ -10403,8 +11210,6 @@ def start_map_complete_return_to_dock(reason="learned map ready"):
     global auto_map_mission_phase, auto_map_return_to_dock_active, auto_map_ready_debug
     global simple_sweep_completed, simple_sweep_completion_reason, simple_sweep_last_debug
     global coverage_status, planner_mode, planner_intent, planner_intent_reason
-    if not AUTO_LEARNED_MAP_CLEANING_ENABLED:
-        return False
     if auto_map_cleaning_started or auto_map_return_to_dock_active or dock_return_active or dock_return_completed:
         return False
     auto_map_mission_phase = "RETURN_TO_DOCK_FOR_K"
@@ -12221,7 +13026,25 @@ def route_or_scan_rotation_mapping_reason(now=None):
     omega = current_angular_velocity
     max_omega = max(abs(cmd_omega), abs(req_omega), abs(omega))
     if max_omega > TURN_MAPPING_OMEGA_LIMIT:
-        return f"omega={max_omega:.2f}"
+        # Forward-arc exception: a heading-lock correction is a differential arc,
+        # not a pivot.  When the robot is actually translating forward on a wide
+        # arc (large radius R = v/omega), the per-frame heading change is tiny and
+        # safe to map; only near-stationary turns produce fans.  Uses the MEASURED
+        # velocities (not the command), so a transient large corr does not count.
+        if (
+            FORWARD_ARC_MAPPING_ENABLED
+            and nav_state == NAV_FORWARD
+            and last_motion_primitive not in (
+                MotionPrimitive.TURN_IN_PLACE.value,
+                MotionPrimitive.FINE_ALIGN.value,
+                MotionPrimitive.CONTACT_RELEASE_TURN.value,
+            )
+            and abs(current_linear_velocity) >= float(FORWARD_ARC_MAPPING_MIN_LINEAR_MPS)
+            and (abs(current_linear_velocity) / max(abs(current_angular_velocity), 1e-3)) >= float(FORWARD_ARC_MAPPING_MIN_RADIUS_M)
+        ):
+            pass  # smooth forward arc -> keep mapping
+        else:
+            return f"omega={max_omega:.2f}"
     if nav_state != NAV_FORWARD and last_motion_primitive in (
         MotionPrimitive.TURN_IN_PLACE.value,
         MotionPrimitive.FINE_ALIGN.value,
@@ -15597,6 +16420,7 @@ def simple_sweep_fsm_speeds(front, center, upper_front, left, right, body_cleara
         if marked_contact:
             update_structural_obstacle_memory()
             update_furniture_zone_cache(force=True)
+            update_leg_quad_fitting()
         if nav_state == NAV_FORWARD and simple_sweep_state == "MOVE_STRAIGHT":
             row_end_candidate_count = 0
             is_row_end, contact_kind = simple_sweep_contact_is_row_end(
@@ -16147,6 +16971,198 @@ def contact_safety_stage_speeds(now, front, center, upper_front, left, right, bo
     return None, bumper_left, bumper_right
 
 
+def mature_dock_return_stall_watchdog(left, right, body_clearance):
+    """Break the wall-hugging loop when a MATURE robot cannot reach the dock.
+
+    The robot is MATURE and should be heading home, but is stuck against a wall
+    chasing unreachable edge targets: recovery/realign maneuvers keep changing
+    nav_state, which aborts the dock route before it can drive away.  When no
+    progress toward the dock is made for a while, blacklist the edge target, back
+    away from the wall and re-commit the dock route.  Unlike the late-contact
+    bailout this does not require near-complete coverage.
+    """
+    global dock_stall_best_dist, dock_stall_best_time, dock_stall_last_action_time, last_dock_stall_debug
+    if not (MATURE_DOCK_STALL_WATCHDOG_ENABLED and RETURN_HOME_ENABLED):
+        last_dock_stall_debug = "dockStall=off"
+        return False
+    if dock_return_completed or not map_mature:
+        last_dock_stall_debug = "dockStall=skip"
+        return False
+    heading_home = bool(
+        dock_return_active
+        or auto_map_return_to_dock_active
+        or planner_mode == "RETURN_HOME"
+        or str(auto_map_mission_phase).startswith("RETURN_TO_DOCK")
+    )
+    if not heading_home:
+        last_dock_stall_debug = "dockStall=notHome"
+        return False
+    now = float(robot.getTime())
+    dist = math.hypot(float(pose_x) - DOCK_TARGET_X, float(pose_y) - DOCK_TARGET_Y)
+    if dist <= DOCK_TARGET_REACHED_M:
+        last_dock_stall_debug = "dockStall=atDock"
+        return False
+    # Reset the timer whenever the robot makes real progress toward the dock.
+    if dock_stall_best_time < -900.0 or dist < float(dock_stall_best_dist) - float(MATURE_DOCK_STALL_PROGRESS_M):
+        dock_stall_best_dist = dist
+        dock_stall_best_time = now
+        last_dock_stall_debug = f"dockStall=progress d={dist:.1f}"
+        return False
+    stall_sec = max(0.0, now - float(dock_stall_best_time))
+    if stall_sec < float(MATURE_DOCK_STALL_SEC):
+        last_dock_stall_debug = f"dockStall=wait {stall_sec:.0f}/{MATURE_DOCK_STALL_SEC:.0f}s d={dist:.1f}"
+        return False
+    if now - float(dock_stall_last_action_time) < float(MATURE_DOCK_STALL_ACTION_COOLDOWN_SEC):
+        return False
+    # Stall confirmed: blacklist the wall-edge target, back away, re-commit dock.
+    dock_stall_last_action_time = now
+    dock_stall_best_time = now
+    dock_stall_best_dist = dist
+    try:
+        if coverage_goal_map is not None:
+            register_map_target_blacklist(
+                int(coverage_goal_map[0]), int(coverage_goal_map[1]), "any",
+                "mature dock stall: unreachable edge target",
+                ttl_sec=MATURE_DOCK_STALL_BLACKLIST_SEC,
+                radius_m=MATURE_DOCK_STALL_BLACKLIST_RADIUS_M,
+            )
+    except Exception:
+        pass
+    try:
+        abort_route_commit("mature dock stall escape")
+    except Exception:
+        pass
+    side = choose_contact_escape_side(False, False, left, right, 0.0)
+    start_recovery_backup(side, f"mature dock stall escape d={dist:.1f}")
+    start_return_to_dock(f"mature dock stall escape d={dist:.1f}")
+    last_dock_stall_debug = f"dockStall=escape d={dist:.1f} t={stall_sec:.0f}s"
+    return True
+
+
+def wall_trapped_frontier_watchdog():
+    """Hybrid fix for the robot oscillating along a wall after an unreachable frontier.
+
+    The frontier sits in a strip between the robot and a wall that is too narrow
+    to enter, and the side wall is never in the forward camera FOV, so the strip
+    never closes and the planner keeps re-selecting it.  When the goal stays
+    pinned next to the robot for a while: FIRST trigger one look-around scan to
+    honestly map the wall (keeps obstacle recall high for the report); if the same
+    spot is still the goal after a scan, blacklist it so exploration moves on.
+
+    Returns True if it took over motion (a scan started), else False.
+    """
+    global wall_trap_anchor, wall_trap_anchor_cov, wall_trap_zone_actions
+    global wall_trap_since, wall_trap_last_action_time, wall_trap_scanned
+    global last_wall_trap_debug, last_planner_update_step
+    if not WALL_TRAP_FRONTIER_WATCHDOG_ENABLED:
+        last_wall_trap_debug = "wallTrap=off"
+        return False
+    if map_mature or dock_return_active or dock_return_completed or known_map_coverage_eval_active():
+        last_wall_trap_debug = "wallTrap=skip"
+        wall_trap_anchor = None
+        wall_trap_zone_actions = 0
+        return False
+    if planner_intent != PLANNER_INTENT_EXPAND_MAP or coverage_goal_kind != "frontier" or coverage_goal_map is None:
+        last_wall_trap_debug = "wallTrap=noFrontier"
+        wall_trap_anchor = None
+        wall_trap_zone_actions = 0
+        return False
+    if nav_state != NAV_FORWARD:
+        return False
+    now = float(robot.getTime())
+    gx, gy = int(coverage_goal_map[0]), int(coverage_goal_map[1])
+    rmx, rmy = world_to_map(pose_x, pose_y)
+    cov_now = float(last_coverage_percent or 0.0)
+    # Trap signature: the ROBOT is pinned in one wall column.  It can still drive
+    # up/down the strip (y varies a lot) and the frontier candidate can jump
+    # along the wall, but the robot column (x) does not move and coverage does
+    # not grow.  Anchor on the robot column + coverage so a jumping candidate no
+    # longer resets the timer (the old bug: 877->850->836 reset it every cycle).
+    col_dist_m = abs(float(gx - rmx)) / float(MAP_SCALE)
+    near = col_dist_m <= float(WALL_TRAP_FRONTIER_NEAR_M)
+    zone_eps_px = float(WALL_TRAP_FRONTIER_ANCHOR_EPS_M) * float(MAP_SCALE)
+    cov_gain = float(WALL_TRAP_FRONTIER_ZONE_COV_GAIN_PERCENT)
+
+    if wall_trap_anchor is None:
+        if near:
+            wall_trap_anchor = (rmx, rmy)
+            wall_trap_anchor_cov = cov_now
+            wall_trap_since = now
+            wall_trap_zone_actions = 0
+        last_wall_trap_debug = f"wallTrap=track near={int(near)} d={col_dist_m:.2f}"
+        return False
+
+    # Reset only on real progress: the robot left the stuck column, or coverage
+    # advanced.  Movement up/down the same strip (y) and candidate jumps do not.
+    robot_left_zone = abs(float(rmx - int(wall_trap_anchor[0]))) > zone_eps_px
+    cov_progress = (cov_now - float(wall_trap_anchor_cov)) >= cov_gain
+    if robot_left_zone or cov_progress:
+        if near:
+            wall_trap_anchor = (rmx, rmy)
+            wall_trap_anchor_cov = cov_now
+            wall_trap_since = now
+            wall_trap_zone_actions = 0
+        else:
+            wall_trap_anchor = None
+            wall_trap_zone_actions = 0
+        last_wall_trap_debug = f"wallTrap=track moved={int(robot_left_zone)} dcov={cov_now - float(wall_trap_anchor_cov):.1f}"
+        return False
+
+    stall = max(0.0, now - float(wall_trap_since))
+    if stall < float(WALL_TRAP_FRONTIER_STALL_SEC):
+        last_wall_trap_debug = f"wallTrap=wait {stall:.0f}/{WALL_TRAP_FRONTIER_STALL_SEC:.0f}s z={wall_trap_zone_actions}"
+        return False
+    if now - float(wall_trap_last_action_time) < float(WALL_TRAP_FRONTIER_ACTION_COOLDOWN_SEC):
+        return False
+    wall_trap_last_action_time = now
+    wall_trap_since = now
+    already_scanned = any(
+        abs(gx - sx) <= zone_eps_px and abs(gy - sy) <= zone_eps_px
+        for sx, sy in wall_trap_scanned
+    )
+    if not already_scanned and wall_trap_zone_actions == 0:
+        # Step 1: turn-and-scan to honestly map the side wall / close the strip.
+        wall_trap_scanned.append((gx, gy))
+        if len(wall_trap_scanned) > 16:
+            wall_trap_scanned = wall_trap_scanned[-16:]
+        wall_trap_zone_actions += 1
+        try:
+            if start_active_rgbd_scan(f"wall-trapped frontier scan @({gx},{gy})"):
+                last_wall_trap_debug = f"wallTrap=scan @({gx},{gy}) t={stall:.0f}s"
+                return True
+        except Exception:
+            pass
+    # Step 2: scan did not free it -> blacklist the unreachable wall frontier.
+    # Escalate the radius once the zone has resisted several actions, so the whole
+    # stuck wall strip is excluded and the picker must choose a far region.
+    wall_trap_zone_actions += 1
+    if wall_trap_zone_actions >= int(WALL_TRAP_FRONTIER_ZONE_MAX_ACTIONS):
+        radius_m = float(WALL_TRAP_FRONTIER_ZONE_BLACKLIST_RADIUS_M)
+        reason = "wall-trapped zone escape (whole strip)"
+    else:
+        radius_m = float(WALL_TRAP_FRONTIER_BLACKLIST_RADIUS_M)
+        reason = "wall-trapped unreachable frontier"
+    try:
+        register_map_target_blacklist(
+            gx, gy, "frontier", reason,
+            ttl_sec=WALL_TRAP_FRONTIER_BLACKLIST_SEC,
+            radius_m=radius_m,
+        )
+    except Exception:
+        pass
+    escaped = wall_trap_zone_actions >= int(WALL_TRAP_FRONTIER_ZONE_MAX_ACTIONS)
+    if escaped:
+        # Zone fully excluded; drop the anchor so the next pinned column starts
+        # a fresh trap cycle elsewhere.
+        wall_trap_anchor = None
+        wall_trap_zone_actions = 0
+    last_planner_update_step = -999999
+    last_wall_trap_debug = (
+        f"wallTrap={'zoneEscape' if escaped else 'blacklist'} @({gx},{gy}) r={radius_m:.1f} t={stall:.0f}s"
+    )
+    return False
+
+
 def choose_motion_from_depth(depth):
     global nav_state, turn_settle_until, nav_action_queue, lane_side, coverage_status, desired_grid_heading, grid_realign_until
     global last_row_change_time, row_end_candidate_count, last_bumper_ignored_as_floor, last_revisit_lane_change_time
@@ -16191,6 +17207,17 @@ def choose_motion_from_depth(depth):
     )
     if contact_cmd is not None:
         return contact_cmd
+
+    # Mature dock-return wall-stall watchdog: if the robot is MATURE and should be
+    # heading home but keeps looping recovery/realign against a wall, force a
+    # back-away + dock re-commit instead of spinning in place forever.
+    if mature_dock_return_stall_watchdog(left, right, body_clearance):
+        return (0.0, 0.0)
+
+    # Wall-trapped frontier watchdog: scan the wall once, then blacklist an
+    # unreachable strip frontier so exploration stops oscillating along a wall.
+    if wall_trapped_frontier_watchdog():
+        return (0.0, 0.0)
 
     # Pre-contact low-object guard. A shelf edge or the red low obstacle can be
     # below the most reliable upper RGB-D band: the bumper may fire only after the
@@ -17113,6 +18140,28 @@ def project_image_feature_to_map(x, y, theta, px, dist):
     return world_to_map(wx, wy)
 
 
+def rgbd_feature_world_height(py, dist):
+    """Estimate the world height (m) of an RGB feature pixel at a given depth.
+
+    The camera is horizontal at CV_SENSOR_HEIGHT_M; the image row maps to an
+    elevation angle via the vertical FOV.  height = sensor_z + dist*sin(el).
+    Top rows look up (positive elevation), so distant high structures (backrest,
+    table top) come out tall and can be excluded from obstacle mapping.
+    """
+    el = (0.5 - (float(py) + 0.5) / max(1.0, float(CAM_H))) * float(CAM_VFOV)
+    return float(CV_SENSOR_HEIGHT_M) + float(dist) * math.sin(el)
+
+
+def rgbd_feature_above_robot(py, dist):
+    """True if a CV feature projects to a height above the mappable robot band."""
+    if not CV_HEIGHT_FILTER_ENABLED:
+        return False
+    try:
+        return rgbd_feature_world_height(py, dist) > float(CV_MAX_OBSTACLE_HEIGHT_M)
+    except Exception:
+        return False
+
+
 def depth_patch_stats(depth, x0, y0, w, h, pad=2):
     """Depth median/std for an RGB bounding box projected to RangeFinder pixels."""
     if depth is None or w <= 0 or h <= 0:
@@ -17449,6 +18498,10 @@ def update_visual_map_from_rgb_depth(pose, frame, depth):
     for x1, y1, x2, y2, pts in features["lines"]:
         projected = []
         for px, py, d in pts:
+            # Height filter: skip samples projecting above the robot band (chair
+            # backrest / table top), which otherwise smear the piece on the map.
+            if rgbd_feature_above_robot(py, d):
+                continue
             mx, my = project_image_feature_to_map(x, y, theta, px, d)
             if map_inside(mx, my) and not rgbd_ray_to_feature_occluded(rx, ry, mx, my):
                 projected.append((px, py, d, mx, my))
@@ -17462,9 +18515,31 @@ def update_visual_map_from_rgb_depth(pose, frame, depth):
         if len(projected) >= 2:
             p0 = (projected[0][3], projected[0][4])
             p1 = (projected[-1][3], projected[-1][4])
+            seg_len = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
             # Only connect short projected segments; long connections are often
             # perspective artifacts across different depths.
-            if math.hypot(p1[0] - p0[0], p1[1] - p0[1]) < 80:
+            connect = seg_len < float(CV_LINE_CONNECT_MAX_MAP_PX)
+            if (
+                connect
+                and CV_LINE_CONNECT_REQUIRE_COLLINEAR
+                and len(projected) >= 3
+                and seg_len > 1.0
+            ):
+                # Fan rejection: the intermediate projected points must lie close
+                # to the straight p0->p1 line.  A real wall/furniture edge projects
+                # collinearly; noisy depth along one RGB line projects into a
+                # spreading fan, which must not be filled into a solid stroke.
+                max_perp = float(CV_LINE_CONNECT_MAX_PERP_DEV_M) * float(MAP_SCALE)
+                dxl = p1[0] - p0[0]
+                dyl = p1[1] - p0[1]
+                worst = 0.0
+                for _px, _py, _d, mxp, myp in projected[1:-1]:
+                    perp = abs(dxl * (p0[1] - myp) - (p0[0] - mxp) * dyl) / max(1.0, seg_len)
+                    if perp > worst:
+                        worst = perp
+                if worst > max_perp:
+                    connect = False
+            if connect:
                 for cx, cy in bresenham(p0[0], p0[1], p1[0], p1[1]):
                     if map_inside(cx, cy):
                         visual_log_odds[cy, cx] = clamp(visual_log_odds[cy, cx] + CV_VISUAL_LINE_UPDATE * 0.35, LO_MIN, LO_MAX)
@@ -17472,6 +18547,11 @@ def update_visual_map_from_rgb_depth(pose, frame, depth):
     # Contours/boxes: add compact obstacle candidates.
     for x0, y0, w, h, rep in features["boxes"]:
         px, py, d = rep
+        # Height filter: if even the bottom edge of the box projects above the
+        # robot band, the whole region is high furniture (backrest/seat/table
+        # top), not a floor-level obstacle -> skip its obstacle contribution.
+        if rgbd_feature_above_robot(y0 + h, d):
+            continue
         mx, my = project_image_feature_to_map(x, y, theta, px, d)
         if map_inside(mx, my) and not rgbd_ray_to_feature_occluded(rx, ry, mx, my):
             mark_cv_free_ray_to_feature(x, y, theta, px, d)
@@ -18052,6 +19132,47 @@ def save_map():
     print("Map saved:", path)
     print("Coverage objective map saved:", planner_path)
     print("Save is passive: motion owner remains", last_control_owner_debug, auto_map_ready_debug, learned_map_sanitize_debug)
+    if METRICS_EXPORT_ON_SAVE:
+        export_metrics_summary("save_map")
+
+
+def save_run_summary(reason=""):
+    """Save map images + JSON metrics snapshot — called on dock return and sim end."""
+    import json
+    try:
+        ts = int(robot.getTime() * 1000)
+        occ_path = maps_dir / f"occupancy_map_{ts:07d}.png"
+        cv2.imwrite(str(occ_path), render_map(auto_crop=False))
+        cov_path = maps_dir / f"coverage_objective_map_{ts:07d}.png"
+        cv2.imwrite(str(cov_path), render_coverage_planner_map(auto_crop=False))
+        metrics = {
+            "time_s": float(robot.getTime()),
+            "reason": str(reason),
+            "coverage_percent": float(last_coverage_percent or 0.0),
+            "coverage_cells": int(last_coverage_cleaned_cells or 0),
+            "total_cells": int(last_coverage_total_cells or 0),
+            "frontier_cells": int(last_frontier_cells or 0),
+            "gray_gap_cells": int(last_gray_gap_cells or 0),
+            "gray_gap_components": int(last_gray_gap_components or 0),
+            "completion_gap_cells": int(last_completion_gap_cells or 0),
+            "completion_gap_components": int(last_completion_gap_components or 0),
+            "obs_boundary_cells": int(last_obs_boundary_cells or 0),
+            "navigation_phase": str(navigation_phase),
+            "planner_confidence": str(planner_confidence),
+            "planner_intent": str(planner_intent),
+            "dock_return_completed": bool(dock_return_completed),
+            "map_mature": bool(map_mature),
+        }
+        metrics_path = maps_dir / f"run_metrics_{ts:07d}.json"
+        with open(str(metrics_path), "w") as f:
+            json.dump(metrics, f, indent=2)
+        print(f"[save_run_summary] {reason} → {metrics_path}")
+        print(f"  cov={metrics['coverage_percent']:.1f}% "
+              f"fr={metrics['frontier_cells']} "
+              f"grayGap={metrics['gray_gap_cells']}/{metrics['gray_gap_components']} "
+              f"obsBoundary={metrics['obs_boundary_cells']}")
+    except Exception as exc:
+        print(f"[save_run_summary] error: {type(exc).__name__}: {exc}")
 
 
 def reset_map():
@@ -18090,6 +19211,7 @@ def reset_map():
     global auto_map_mission_phase, auto_map_return_to_dock_active, auto_map_cleaning_started, auto_map_final_dock_requested
     global auto_map_ready_best_coverage, auto_map_ready_best_time, auto_map_ready_debug, learned_map_sanitized_once, learned_map_sanitize_debug
     global last_gray_gap_cells, last_gray_gap_components, last_gray_gap_debug
+    global last_completion_gap_cells, last_completion_gap_components, last_completion_gap_debug
     global simple_sweep_best_coverage_percent, simple_sweep_best_coverage_time, simple_sweep_best_coverage_x, simple_sweep_best_coverage_y
     global last_side_strip_cleanup_time, last_side_strip_cleanup_reason
     global last_nearby_route_cleanup_time, last_nearby_route_cleanup_reason
@@ -18314,6 +19436,9 @@ def reset_map():
     last_gray_gap_cells = 0
     last_gray_gap_components = 0
     last_gray_gap_debug = "grayGap=reset"
+    last_completion_gap_cells = 0
+    last_completion_gap_components = 0
+    last_completion_gap_debug = "completion=reset"
     global frontier_only_stall_since, frontier_only_stall_blacklists, frontier_only_last_blacklist_time, frontier_only_last_stall_debug
     frontier_only_stall_since = -999.0
     frontier_only_stall_blacklists = 0
@@ -18335,6 +19460,244 @@ def reset_map():
     refresh_navigation_phase()
     invalidate_heavy_map_caches("reset")
     print("Map reset")
+
+def update_metrics_path_length():
+    """Accumulate travelled path length from the same odometry pose used by maps."""
+    global metrics_path_length_m, metrics_prev_pose
+    try:
+        cur = (float(pose_x), float(pose_y))
+        if metrics_prev_pose is not None:
+            dx = cur[0] - float(metrics_prev_pose[0])
+            dy = cur[1] - float(metrics_prev_pose[1])
+            ds = math.hypot(dx, dy)
+            # Ignore teleport/reset jumps and sub-millimetre numerical jitter.
+            if 0.0005 <= ds <= 0.35:
+                metrics_path_length_m += ds
+        metrics_prev_pose = cur
+    except Exception:
+        pass
+
+
+def localization_error_fields():
+    """Ground-truth vs odometry localization error from the metrics-only GPS.
+
+    Returns a dict with gt_x_m/gt_y_m/localization_error_m, or {} if no GPS.
+    The error is the displacement mismatch since the first sample: how far the
+    odometry-estimated travel diverges from the true travel.  This is coordinate-
+    frame agnostic (both displacements are measured from their own t0 origin) and
+    needs no absolute alignment between the odometry and world frames.
+    """
+    global metrics_gps_origin, metrics_odom_origin
+    if gt_gps is None:
+        return {}
+    try:
+        vals = gt_gps.getValues()
+        if vals is None or len(vals) < 2 or not all(math.isfinite(v) for v in vals[:2]):
+            return {}
+        gx, gy = float(vals[0]), float(vals[1])
+        if metrics_gps_origin is None:
+            metrics_gps_origin = (gx, gy)
+            metrics_odom_origin = (float(pose_x), float(pose_y))
+        true_dx = gx - metrics_gps_origin[0]
+        true_dy = gy - metrics_gps_origin[1]
+        odom_dx = float(pose_x) - metrics_odom_origin[0]
+        odom_dy = float(pose_y) - metrics_odom_origin[1]
+        loc_err = math.hypot(odom_dx - true_dx, odom_dy - true_dy)
+        return {
+            "gt_x_m": gx,
+            "gt_y_m": gy,
+            "localization_error_m": loc_err,
+        }
+    except Exception:
+        return {}
+
+
+def _gt_world_to_map(wx, wy):
+    """Webots world (x,y) -> controller map cell, aligned via the t0 GPS sample."""
+    ox = float(wx) - metrics_gps_origin[0] + metrics_odom_origin[0]
+    oy = float(wy) - metrics_gps_origin[1] + metrics_odom_origin[1]
+    return (int(round(MAP_ORIGIN_X + ox * MAP_SCALE)), int(round(MAP_ORIGIN_Y - oy * MAP_SCALE)))
+
+
+def build_ground_truth_grid_if_ready():
+    """Build the .wbt ground-truth obstacle grid once, after the t0 GPS origin is known."""
+    global metrics_gt_grid, metrics_gt_debug
+    if not (GROUND_TRUTH_METRICS_ENABLED and METRICS_ENABLED):
+        return None
+    if metrics_gt_grid is not None:
+        return metrics_gt_grid
+    if metrics_gps_origin is None or metrics_odom_origin is None:
+        metrics_gt_debug = "gt=wait gps"
+        return None
+    try:
+        wbt_path = robot.getWorldPath()
+        parsed = ground_truth_map.parse_world_obstacles(wbt_path)
+        grid, drawn = ground_truth_map.build_ground_truth_grid(
+            parsed, _gt_world_to_map, MAP_SIZE,
+            robot_height_m=GROUND_TRUTH_ROBOT_HEIGHT_M,
+            floor_eps_m=GROUND_TRUTH_FLOOR_EPS_M,
+            wall_thickness_m=GROUND_TRUTH_WALL_THICKNESS_M,
+            map_scale=MAP_SCALE,
+        )
+        metrics_gt_grid = grid
+        metrics_gt_debug = f"gt=built obs={drawn} cells={int(np.count_nonzero(grid))}"
+        print("[METRICS] ground-truth obstacle map built:", metrics_gt_debug)
+        try:
+            ground_truth_map.save_ground_truth_png(grid, metrics_dir / "ground_truth_obstacles.png")
+        except Exception:
+            pass
+        return metrics_gt_grid
+    except Exception as exc:
+        metrics_gt_debug = f"gt=err {type(exc).__name__}"
+        return None
+
+
+def collect_metrics_snapshot(heavy=False):
+    """Build one metrics row for quantitative experiments.
+
+    The light part is cheap and sampled every second.  The heavy part touches map
+    masks and quality checks; it is sampled less often so it does not distort the
+    real-time controller being measured.
+    """
+    global metrics_last_debug
+    now = float(robot.getTime())
+    snap = {
+        "time_s": now,
+        "step_id": int(step_id),
+        "pose_x_m": float(pose_x),
+        "pose_y_m": float(pose_y),
+        "pose_theta_deg": math.degrees(float(pose_theta)),
+        "path_length_m": float(metrics_path_length_m),
+        "coverage_percent": float(last_coverage_percent or 0.0),
+        "coverage_cleaned_cells": int(last_coverage_cleaned_cells or 0),
+        "coverage_total_cells": int(last_coverage_total_cells or 0),
+        "uncleaned_cells": int(last_uncleaned_cells or 0),
+        "frontier_cells": int(last_frontier_cells or 0),
+        "gray_gap_cells": int(last_gray_gap_cells or 0),
+        "gray_gap_components": int(last_gray_gap_components or 0),
+        "planner_intent": str(planner_intent),
+        "planner_mode": str(planner_mode),
+        "navigation_phase": str(navigation_phase),
+        "nav_state": str(nav_state),
+        "owner_source": str(current_owner_source_label()),
+        "control_owner": str(last_control_owner_debug),
+        "route_active": bool(route_commit_active),
+        "route_kind": str(route_commit_kind),
+        "route_len_cells": int(len(route_commit_route_map or [])),
+        "route_cost_m": float(route_commit_cost) if np.isfinite(route_commit_cost) else -1.0,
+        "route_status": str(coverage_route_status),
+        "map_mature": bool(map_mature),
+        "known_map_active": bool(known_map_coverage_eval_active()),
+        "dock_completed": bool(dock_return_completed),
+        "loop_ms": float(last_perf_loop_ms or 0.0),
+        "planner_ms": float(last_route_planner_ms or 0.0),
+        "planner_nodes": int(last_route_planner_nodes or 0),
+        "load_shedding": str(load_shedding_debug_text()),
+        "bumper_active": bool(last_bumper_any_raw_active),
+        "low_obstacle_debug": str(last_low_obstacle_memory_debug),
+    }
+    snap.update(localization_error_fields())
+    if heavy:
+        try:
+            actual, center_no_go, cleanable_floor = build_planning_layers(force=False)
+            raw = base_physical_obstacle_mask().astype(np.bool_)
+            contact = (contact_log_odds > CONTACT_OCCUPIED_EPS).astype(np.bool_)
+            structural = (structural_log_odds > STRUCTURAL_OCCUPIED_EPS).astype(np.bool_) if STRUCTURAL_OBSTACLE_MEMORY_ENABLED else np.zeros_like(raw, dtype=np.bool_)
+            thin = (thin_obstacle_log_odds > THIN_OBSTACLE_CONFIRM_EPS).astype(np.bool_) if THIN_OBSTACLE_CONFIRM_ENABLED else np.zeros_like(raw, dtype=np.bool_)
+            hyp = hypothesis_obstacle_mask(force=False).astype(np.bool_) if OBSTACLE_HYPOTHESIS_ENABLED else np.zeros_like(raw, dtype=np.bool_)
+            protected = contact | structural | thin
+            weak_unconfirmed = actual.astype(np.bool_) & (~protected)
+            # learned_map_static_quality_gate is not present on this branch; keep
+            # the quality field optional so the heavy sample still records masks.
+            if "learned_map_static_quality_gate" in globals():
+                total_for_quality = int(last_coverage_total_cells or np.count_nonzero(cleanable_floor))
+                quality_ok, quality_debug = globals()["learned_map_static_quality_gate"](obs_mask=actual.astype(np.bool_), total_cells=total_for_quality)
+            else:
+                quality_ok, quality_debug = True, "quality_gate=n/a"
+            snap.update({
+                "raw_obstacle_cells": int(np.count_nonzero(raw)),
+                "actual_obstacle_cells": int(np.count_nonzero(actual)),
+                "no_go_cells": int(np.count_nonzero(center_no_go)),
+                "hypothesis_obstacle_cells": int(np.count_nonzero(hyp)),
+                "contact_obstacle_cells": int(np.count_nonzero(contact)),
+                "structural_obstacle_cells": int(np.count_nonzero(structural)),
+                "thin_obstacle_cells": int(np.count_nonzero(thin)),
+                "weak_unconfirmed_obstacle_cells": int(np.count_nonzero(weak_unconfirmed)),
+                "quality_ok": bool(quality_ok),
+                "quality_debug": str(quality_debug),
+            })
+            # Ground-truth obstacle-map accuracy: compare the learned obstacle mask
+            # against the .wbt reference, restricted to explored cells so unknown
+            # areas are not counted as error.
+            gt_grid = build_ground_truth_grid_if_ready()
+            if gt_grid is not None:
+                explored = actual.astype(np.bool_) | cleanable_floor.astype(np.bool_)
+                gt_tol_px = int(round(float(GROUND_TRUTH_MATCH_TOLERANCE_M) * float(MAP_SCALE)))
+                gt_stats = ground_truth_map.false_cell_metrics(actual.astype(np.bool_), gt_grid, explored, tolerance_px=gt_tol_px)
+                snap.update({
+                    "gt_obstacle_cells": gt_stats["gt_obstacle_cells"],
+                    "false_occupied_cells": gt_stats["false_occupied_cells"],
+                    "false_free_cells": gt_stats["false_free_cells"],
+                    "false_occupied_ratio": gt_stats["false_occupied_ratio"],
+                    "obstacle_precision": gt_stats["obstacle_precision"],
+                    "obstacle_recall": gt_stats["obstacle_recall"],
+                })
+                # Refresh the overlay PNG (robot map vs ground truth). Overwrites,
+                # so the final file reflects the end-of-run obstacle accuracy.
+                try:
+                    ground_truth_map.save_comparison_png(
+                        actual.astype(np.bool_), gt_grid,
+                        metrics_dir / "obstacle_comparison.png", explored,
+                        tolerance_px=gt_tol_px)
+                except Exception:
+                    pass
+            metrics_last_debug = f"metrics=sample heavy weak={int(np.count_nonzero(weak_unconfirmed))}"
+        except Exception as exc:
+            snap.update({"quality_ok": False, "quality_debug": f"metrics heavy err {type(exc).__name__}"})
+            metrics_last_debug = f"metrics=err {type(exc).__name__}"
+    else:
+        metrics_last_debug = "metrics=sample light"
+    return snap
+
+
+def record_metrics_if_due(force=False):
+    global metrics_last_sample_time, metrics_last_heavy_sample_time, metrics_last_autoexport_time
+    if not METRICS_ENABLED:
+        return
+    try:
+        now = float(robot.getTime())
+        update_metrics_path_length()
+        if (not force) and now - float(metrics_last_sample_time) < float(METRICS_SAMPLE_PERIOD_SEC):
+            return
+        heavy = force or (now - float(metrics_last_heavy_sample_time) >= float(METRICS_HEAVY_SAMPLE_PERIOD_SEC))
+        snap = collect_metrics_snapshot(heavy=heavy)
+        metrics_recorder.record(snap)
+        metrics_last_sample_time = now
+        if heavy:
+            metrics_last_heavy_sample_time = now
+        # Periodic autosave of summary.json/latest_summary.json so a final
+        # aggregate exists even if Webots is killed instead of exiting cleanly.
+        # The per-second timeseries.csv is already flushed continuously above.
+        if now - float(metrics_last_autoexport_time) >= float(METRICS_SUMMARY_AUTOEXPORT_SEC):
+            metrics_recorder.export_summary()
+            metrics_last_autoexport_time = now
+    except Exception as exc:
+        # Metrics must never stop the robot controller.
+        globals()["metrics_last_debug"] = f"metrics=err {type(exc).__name__}"
+
+
+def export_metrics_summary(reason="manual"):
+    if not METRICS_ENABLED:
+        return None
+    try:
+        record_metrics_if_due(force=True)
+        summary = metrics_recorder.export_summary()
+        print("Metrics exported:", metrics_recorder.summary_path, "reason=", reason)
+        return summary
+    except Exception as exc:
+        print("Metrics export failed:", type(exc).__name__, exc)
+        return None
+
 
 # ---------------- Main loop ----------------
 if SHOW_WINDOWS:
@@ -18386,10 +19749,21 @@ while robot.step(timestep) != -1:
     run_window_stage(frame, depth)
 
     last_perf_loop_ms = perf_end("loop", loop_t0)
+    record_metrics_if_due()
     last_perf_debug = perf_text(150)
     print_debug_status_if_due()
 
     step_id += 1
 
 set_wheel_speeds(0, 0)
+if AUTO_SAVE_ON_SIM_END:
+    try:
+        save_run_summary("sim_end")
+    except Exception:
+        pass
+try:
+    export_metrics_summary("controller exit")
+    metrics_recorder.close()
+except Exception:
+    pass
 cv2.destroyAllWindows()

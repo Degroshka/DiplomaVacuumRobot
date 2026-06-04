@@ -1,0 +1,10 @@
+time_s,step_id,event,detail
+96.288,3008,recovery,RECOVERY_BACKUP
+107.552,3360,recovery,RECOVERY_BACKUP
+309.280,9664,recovery,RECOVERY_BACKUP
+318.496,9952,recovery,RECOVERY_BACKUP
+329.760,10304,recovery,CONTACT_BACKUP
+329.760,10304,route_abort,NONE:route abort: conta t=0.0s d=0.04/0.00 wavefront frontier cost=0.52m len=4 score=87.8 comp=0 fp=626/0.33 cont=0.0 wall=0.0 seg=point geom first=175deg corn commitType=frontier intent=EXPAND_MAP fr=291 exploreRoute=frontier-only cost=3. noise=cache18:obs-3/ defer=0 plan=73ms/168
+329.760,10304,low_obstacle_mark,"lowObs=mark (188,865) r=5 contact support"
+476.192,14880,recovery,CONTACT_WAIT_CLEAR
+476.192,14880,low_obstacle_mark,"lowObs=mark (777,603) r=5 contact support"
