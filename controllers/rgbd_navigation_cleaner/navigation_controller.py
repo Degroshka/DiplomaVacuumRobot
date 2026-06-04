@@ -634,6 +634,15 @@ auto_map_return_to_dock_active = False
 auto_map_cleaning_started = False
 auto_map_final_dock_requested = False
 auto_map_ready_best_coverage = -1.0
+dock_stall_best_dist = float("inf")
+dock_stall_best_time = -999.0
+dock_stall_last_action_time = -999.0
+last_dock_stall_debug = "dockStall=init"
+wall_trap_anchor = None
+wall_trap_since = -999.0
+wall_trap_last_action_time = -999.0
+wall_trap_scanned = []
+last_wall_trap_debug = "wallTrap=init"
 auto_map_ready_best_time = -999.0
 auto_map_ready_debug = "autoMap=init"
 learned_map_sanitized_once = False
@@ -1321,7 +1330,7 @@ def compact_debug_status_line():
         f"{runtime_arena_guard_debug[:24]} {odom_arena_clamp_debug[:22]} {frontier_route_abort_hold_debug[:24]} "
         f"{last_hypothesis_obstacle_debug[:28]} {last_near_collision_hypothesis_debug[:22]} {last_low_obstacle_memory_debug[:22]} "
         f"plan={last_planning_layer_debug[:34]} "
-        f"scan={last_active_scan_debug[:28]} gate={last_frontier_only_gate_debug[:30]} occ={last_rgbd_occlusion_debug[:18]} {last_debug_viewer_status[:22]} {last_render_throttle_debug[:18]} {load_shedding_debug_text()[:24]} {metrics_last_debug[:22]}"
+        f"scan={last_active_scan_debug[:28]} gate={last_frontier_only_gate_debug[:30]} occ={last_rgbd_occlusion_debug[:18]} {last_debug_viewer_status[:22]} {last_render_throttle_debug[:18]} {load_shedding_debug_text()[:24]} {metrics_last_debug[:22]} {last_dock_stall_debug[:24]} {last_wall_trap_debug[:26]}"
     )
 
 
@@ -4069,7 +4078,18 @@ def clear_contact_evidence_cell(mx, my, delta=CONTACT_FREE_UPDATE):
     place as empty.
     """
     if map_inside(mx, my) and contact_log_odds[my, mx] > 0.0:
-        contact_log_odds[my, mx] = clamp(contact_log_odds[my, mx] + delta, CONTACT_MIN, CONTACT_MAX)
+        d = float(delta)
+        # Bumper contact is physical proof; depth can miss LOW objects that pass
+        # under the forward FOV.  While the contact is still strongly confirmed,
+        # clear it much more slowly so a hit low object is not erased by a few
+        # "free" depth frames before the planner routes around it.
+        if (
+            CONTACT_DEPTH_CLEAR_PROTECT_ENABLED
+            and d < 0.0
+            and contact_log_odds[my, mx] > float(CONTACT_DEPTH_CLEAR_PROTECT_EPS)
+        ):
+            d *= float(CONTACT_DEPTH_CLEAR_PROTECT_FACTOR)
+        contact_log_odds[my, mx] = clamp(contact_log_odds[my, mx] + d, CONTACT_MIN, CONTACT_MAX)
 
 
 def clear_contact_evidence_along_ray(x0, y0, x1, y1, delta=CONTACT_FREE_UPDATE):
@@ -7309,6 +7329,12 @@ def exploration_mapping_snapshot_allowed():
         return False
     if map_mature or str(planner_confidence or "") == "MATURE":
         return False
+    # Never fuse a stationary snapshot while the robot is in contact recovery:
+    # it sits at an oblique pose hard against an object (e.g. the low red box),
+    # so its depth rays smear a fan of bad geometry into the map and corrupt
+    # localization.  Let the robot escape the contact first.
+    if nav_state in CONTACT_RECOVERY_STATES:
+        return False
     return True
 
 
@@ -7952,6 +7978,21 @@ def exploration_frontier_only_owner_gate(front, center, body_clearance, left=Non
         last_frontier_only_gate_debug = f"frontierGate=snapshot fr={frontiers} cov={cov:.1f}"
         last_planner_update_step = -999999
         return True
+
+    # Anti-freeze: if we have held owner=NONE on a stationary robot for a while
+    # (frontier route present but never committable, snapshots on cooldown), do
+    # NOT keep the robot standing still ("lost control").  Hand motion back to
+    # ROW_FORWARD so it drives, gathers RGB-D evidence and leaves the dead spot;
+    # the stall watchdog above still escalates to blacklist/dock independently.
+    try:
+        hold_stall_sec = (now - float(frontier_only_stall_since)) if frontier_only_stall_since > -100.0 else 0.0
+    except Exception:
+        hold_stall_sec = 0.0
+    if hold_stall_sec >= float(EXPLORATION_FRONTIER_ONLY_HOLD_RELEASE_SEC):
+        coverage_status = f"frontier-only hold-release -> row: stuck {hold_stall_sec:.0f}s fr={frontiers}"
+        last_optional_block_reason = "frontier-only hold too long -> let ROW_FORWARD drive"
+        last_frontier_only_gate_debug = f"frontierGate=holdRelease {hold_stall_sec:.0f}s->row"
+        return False
 
     coverage_status = f"frontier-only hold: {str(route_reason)[:52]} fr={frontiers} cov={cov:.1f}"
     last_optional_block_reason = "frontier-only blocks ROW_FORWARD"
@@ -16317,6 +16358,156 @@ def contact_safety_stage_speeds(now, front, center, upper_front, left, right, bo
     return None, bumper_left, bumper_right
 
 
+def mature_dock_return_stall_watchdog(left, right, body_clearance):
+    """Break the wall-hugging loop when a MATURE robot cannot reach the dock.
+
+    The robot is MATURE and should be heading home, but is stuck against a wall
+    chasing unreachable edge targets: recovery/realign maneuvers keep changing
+    nav_state, which aborts the dock route before it can drive away.  When no
+    progress toward the dock is made for a while, blacklist the edge target, back
+    away from the wall and re-commit the dock route.  Unlike the late-contact
+    bailout this does not require near-complete coverage.
+    """
+    global dock_stall_best_dist, dock_stall_best_time, dock_stall_last_action_time, last_dock_stall_debug
+    if not (MATURE_DOCK_STALL_WATCHDOG_ENABLED and RETURN_HOME_ENABLED):
+        last_dock_stall_debug = "dockStall=off"
+        return False
+    if dock_return_completed or not map_mature:
+        last_dock_stall_debug = "dockStall=skip"
+        return False
+    heading_home = bool(
+        dock_return_active
+        or auto_map_return_to_dock_active
+        or planner_mode == "RETURN_HOME"
+        or str(auto_map_mission_phase).startswith("RETURN_TO_DOCK")
+    )
+    if not heading_home:
+        last_dock_stall_debug = "dockStall=notHome"
+        return False
+    now = float(robot.getTime())
+    dist = math.hypot(float(pose_x) - DOCK_TARGET_X, float(pose_y) - DOCK_TARGET_Y)
+    if dist <= DOCK_TARGET_REACHED_M:
+        last_dock_stall_debug = "dockStall=atDock"
+        return False
+    # Reset the timer whenever the robot makes real progress toward the dock.
+    if dock_stall_best_time < -900.0 or dist < float(dock_stall_best_dist) - float(MATURE_DOCK_STALL_PROGRESS_M):
+        dock_stall_best_dist = dist
+        dock_stall_best_time = now
+        last_dock_stall_debug = f"dockStall=progress d={dist:.1f}"
+        return False
+    stall_sec = max(0.0, now - float(dock_stall_best_time))
+    if stall_sec < float(MATURE_DOCK_STALL_SEC):
+        last_dock_stall_debug = f"dockStall=wait {stall_sec:.0f}/{MATURE_DOCK_STALL_SEC:.0f}s d={dist:.1f}"
+        return False
+    if now - float(dock_stall_last_action_time) < float(MATURE_DOCK_STALL_ACTION_COOLDOWN_SEC):
+        return False
+    # Stall confirmed: blacklist the wall-edge target, back away, re-commit dock.
+    dock_stall_last_action_time = now
+    dock_stall_best_time = now
+    dock_stall_best_dist = dist
+    try:
+        if coverage_goal_map is not None:
+            register_map_target_blacklist(
+                int(coverage_goal_map[0]), int(coverage_goal_map[1]), "any",
+                "mature dock stall: unreachable edge target",
+                ttl_sec=MATURE_DOCK_STALL_BLACKLIST_SEC,
+                radius_m=MATURE_DOCK_STALL_BLACKLIST_RADIUS_M,
+            )
+    except Exception:
+        pass
+    try:
+        abort_route_commit("mature dock stall escape")
+    except Exception:
+        pass
+    side = choose_contact_escape_side(False, False, left, right, 0.0)
+    start_recovery_backup(side, f"mature dock stall escape d={dist:.1f}")
+    start_return_to_dock(f"mature dock stall escape d={dist:.1f}")
+    last_dock_stall_debug = f"dockStall=escape d={dist:.1f} t={stall_sec:.0f}s"
+    return True
+
+
+def wall_trapped_frontier_watchdog():
+    """Hybrid fix for the robot oscillating along a wall after an unreachable frontier.
+
+    The frontier sits in a strip between the robot and a wall that is too narrow
+    to enter, and the side wall is never in the forward camera FOV, so the strip
+    never closes and the planner keeps re-selecting it.  When the goal stays
+    pinned next to the robot for a while: FIRST trigger one look-around scan to
+    honestly map the wall (keeps obstacle recall high for the report); if the same
+    spot is still the goal after a scan, blacklist it so exploration moves on.
+
+    Returns True if it took over motion (a scan started), else False.
+    """
+    global wall_trap_anchor, wall_trap_since, wall_trap_last_action_time, wall_trap_scanned
+    global last_wall_trap_debug, last_planner_update_step
+    if not WALL_TRAP_FRONTIER_WATCHDOG_ENABLED:
+        last_wall_trap_debug = "wallTrap=off"
+        return False
+    if map_mature or dock_return_active or dock_return_completed or known_map_coverage_eval_active():
+        last_wall_trap_debug = "wallTrap=skip"
+        wall_trap_anchor = None
+        return False
+    if planner_intent != PLANNER_INTENT_EXPAND_MAP or coverage_goal_kind != "frontier" or coverage_goal_map is None:
+        last_wall_trap_debug = "wallTrap=noFrontier"
+        wall_trap_anchor = None
+        return False
+    if nav_state != NAV_FORWARD:
+        return False
+    now = float(robot.getTime())
+    gx, gy = int(coverage_goal_map[0]), int(coverage_goal_map[1])
+    rmx, rmy = world_to_map(pose_x, pose_y)
+    # Measure proximity by COLUMN (x), not full distance: the robot drives up and
+    # down the strip (y varies a lot) while the frontier stays pinned in the same
+    # x-column next to a wall.  Euclidean distance would spike at the ends of each
+    # pass and reset the timer; column distance stays small the whole time.
+    col_dist_m = abs(float(gx - rmx)) / float(MAP_SCALE)
+    near = col_dist_m <= float(WALL_TRAP_FRONTIER_NEAR_M)
+    anchor_eps_px = float(WALL_TRAP_FRONTIER_ANCHOR_EPS_M) * float(MAP_SCALE)
+    # The trap signature is a frontier pinned near the robot whose column (x) does
+    # not move even though the robot keeps driving: reset the timer otherwise.
+    if (wall_trap_anchor is None) or (not near) or abs(gx - int(wall_trap_anchor[0])) > anchor_eps_px:
+        wall_trap_anchor = (gx, gy) if near else None
+        wall_trap_since = now if near else -999.0
+        last_wall_trap_debug = f"wallTrap=track near={int(near)} d={col_dist_m:.2f}"
+        return False
+    stall = max(0.0, now - float(wall_trap_since))
+    if stall < float(WALL_TRAP_FRONTIER_STALL_SEC):
+        last_wall_trap_debug = f"wallTrap=wait {stall:.0f}/{WALL_TRAP_FRONTIER_STALL_SEC:.0f}s d={col_dist_m:.2f}"
+        return False
+    if now - float(wall_trap_last_action_time) < float(WALL_TRAP_FRONTIER_ACTION_COOLDOWN_SEC):
+        return False
+    wall_trap_last_action_time = now
+    wall_trap_since = now
+    already_scanned = any(
+        abs(gx - sx) <= anchor_eps_px and abs(gy - sy) <= anchor_eps_px
+        for sx, sy in wall_trap_scanned
+    )
+    if not already_scanned:
+        # Step 1 (#2): turn-and-scan to honestly map the side wall / close the strip.
+        wall_trap_scanned.append((gx, gy))
+        if len(wall_trap_scanned) > 16:
+            wall_trap_scanned = wall_trap_scanned[-16:]
+        try:
+            if start_active_rgbd_scan(f"wall-trapped frontier scan @({gx},{gy})"):
+                last_wall_trap_debug = f"wallTrap=scan @({gx},{gy}) t={stall:.0f}s"
+                return True
+        except Exception:
+            pass
+    # Step 2 (#1): scan did not free it -> blacklist the unreachable wall frontier.
+    try:
+        register_map_target_blacklist(
+            gx, gy, "frontier", "wall-trapped unreachable frontier",
+            ttl_sec=WALL_TRAP_FRONTIER_BLACKLIST_SEC,
+            radius_m=WALL_TRAP_FRONTIER_BLACKLIST_RADIUS_M,
+        )
+    except Exception:
+        pass
+    wall_trap_anchor = None
+    last_planner_update_step = -999999
+    last_wall_trap_debug = f"wallTrap=blacklist @({gx},{gy}) t={stall:.0f}s"
+    return False
+
+
 def choose_motion_from_depth(depth):
     global nav_state, turn_settle_until, nav_action_queue, lane_side, coverage_status, desired_grid_heading, grid_realign_until
     global last_row_change_time, row_end_candidate_count, last_bumper_ignored_as_floor, last_revisit_lane_change_time
@@ -16361,6 +16552,17 @@ def choose_motion_from_depth(depth):
     )
     if contact_cmd is not None:
         return contact_cmd
+
+    # Mature dock-return wall-stall watchdog: if the robot is MATURE and should be
+    # heading home but keeps looping recovery/realign against a wall, force a
+    # back-away + dock re-commit instead of spinning in place forever.
+    if mature_dock_return_stall_watchdog(left, right, body_clearance):
+        return (0.0, 0.0)
+
+    # Wall-trapped frontier watchdog: scan the wall once, then blacklist an
+    # unreachable strip frontier so exploration stops oscillating along a wall.
+    if wall_trapped_frontier_watchdog():
+        return (0.0, 0.0)
 
     # Pre-contact low-object guard. A shelf edge or the red low obstacle can be
     # below the most reliable upper RGB-D band: the bumper may fire only after the
@@ -18626,6 +18828,10 @@ def build_ground_truth_grid_if_ready():
         metrics_gt_grid = grid
         metrics_gt_debug = f"gt=built obs={drawn} cells={int(np.count_nonzero(grid))}"
         print("[METRICS] ground-truth obstacle map built:", metrics_gt_debug)
+        try:
+            ground_truth_map.save_ground_truth_png(grid, metrics_dir / "ground_truth_obstacles.png")
+        except Exception:
+            pass
         return metrics_gt_grid
     except Exception as exc:
         metrics_gt_debug = f"gt=err {type(exc).__name__}"
@@ -18721,6 +18927,14 @@ def collect_metrics_snapshot(heavy=False):
                     "obstacle_precision": gt_stats["obstacle_precision"],
                     "obstacle_recall": gt_stats["obstacle_recall"],
                 })
+                # Refresh the overlay PNG (robot map vs ground truth). Overwrites,
+                # so the final file reflects the end-of-run obstacle accuracy.
+                try:
+                    ground_truth_map.save_comparison_png(
+                        actual.astype(np.bool_), gt_grid,
+                        metrics_dir / "obstacle_comparison.png", explored)
+                except Exception:
+                    pass
             metrics_last_debug = f"metrics=sample heavy weak={int(np.count_nonzero(weak_unconfirmed))}"
         except Exception as exc:
             snap.update({"quality_ok": False, "quality_debug": f"metrics heavy err {type(exc).__name__}"})

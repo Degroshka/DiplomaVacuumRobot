@@ -164,6 +164,10 @@ EXPLORATION_FRONTIER_ONLY_SNAPSHOT_COOLDOWN_SEC = 4.8
 EXPLORATION_FRONTIER_ONLY_SNAPSHOT_MIN_FRONT_CLEAR_M = 0.30
 EXPLORATION_FRONTIER_ONLY_SNAPSHOT_MIN_BODY_CLEAR_M = 0.070
 EXPLORATION_FRONTIER_ONLY_STALL_WATCHDOG_ENABLED = True
+# Anti-freeze: hand motion back to ROW_FORWARD if the frontier-only gate has held
+# a stationary robot (owner=NONE) this long with no committable route, instead of
+# standing still until the slower blacklist/dock escalation fires.
+EXPLORATION_FRONTIER_ONLY_HOLD_RELEASE_SEC = 15.0
 EXPLORATION_FRONTIER_ONLY_STALL_TIMEOUT_SEC = 12.0
 EXPLORATION_FRONTIER_ONLY_STALL_POSE_EPS_M = 0.07
 EXPLORATION_FRONTIER_ONLY_STALL_HEADING_EPS_RAD = math.radians(18.0)
@@ -389,6 +393,15 @@ LO_MAX = 7.0
 CONTACT_OCCUPIED_EPS = 1.0
 CONTACT_OCC_UPDATE = 2.7
 CONTACT_FREE_UPDATE = -0.38
+# Protect bumper-confirmed contact from being erased by depth that cannot see
+# LOW objects (e.g. the 10 cm red box sits below the forward camera FOV, so the
+# depth ray passes over it and reports "free").  While the contact is still
+# strongly confirmed, depth clears it much more slowly, so a low object the robot
+# physically hit stays on the map long enough for the planner to route around it
+# instead of driving back into it.  It can still be cleared once it has decayed.
+CONTACT_DEPTH_CLEAR_PROTECT_ENABLED = False
+CONTACT_DEPTH_CLEAR_PROTECT_EPS = 1.0
+CONTACT_DEPTH_CLEAR_PROTECT_FACTOR = 0.22
 CONTACT_MIN = 0.0
 CONTACT_MAX = 5.2
 CONTACT_MARK_RADIUS_M = 0.035
@@ -1142,6 +1155,30 @@ DOCK_ROUTE_GRID_PADDING_M = 0.85
 DOCK_ROUTE_NEAREST_GOAL_RADIUS = 8
 DOCK_STUCK_RETURN_COVERAGE_PERCENT = 96.0
 DOCK_STUCK_RECOVERY_SEC = 7.0
+# Mature dock-return wall-stall watchdog.  When the map is MATURE and the robot
+# should be heading home but is looping recovery/realign maneuvers against a wall
+# (chasing unreachable edge targets) without getting closer to the dock, blacklist
+# the edge target, back away from the wall and re-commit the dock route.  Unlike
+# DOCK_STUCK_* above this does NOT require near-complete coverage.
+MATURE_DOCK_STALL_WATCHDOG_ENABLED = True
+MATURE_DOCK_STALL_SEC = 28.0
+MATURE_DOCK_STALL_PROGRESS_M = 0.30
+MATURE_DOCK_STALL_ACTION_COOLDOWN_SEC = 10.0
+MATURE_DOCK_STALL_BLACKLIST_RADIUS_M = 0.80
+MATURE_DOCK_STALL_BLACKLIST_SEC = 150.0
+
+# Wall-trapped frontier watchdog (exploration phase).  When the robot oscillates
+# along a wall chasing a frontier that sits in a strip too narrow to enter (the
+# side wall is not in the forward camera FOV, so the strip never closes), first
+# do ONE look-around scan to honestly map the wall; if the frontier is still
+# trapped after that, blacklist it so the planner moves on to reachable unknown.
+WALL_TRAP_FRONTIER_WATCHDOG_ENABLED = True
+WALL_TRAP_FRONTIER_NEAR_M = 0.42
+WALL_TRAP_FRONTIER_ANCHOR_EPS_M = 0.32
+WALL_TRAP_FRONTIER_STALL_SEC = 22.0
+WALL_TRAP_FRONTIER_ACTION_COOLDOWN_SEC = 8.0
+WALL_TRAP_FRONTIER_BLACKLIST_RADIUS_M = 0.55
+WALL_TRAP_FRONTIER_BLACKLIST_SEC = 120.0
 DOCK_STOP_HOLD_OWNER_SEC = 9999.0
 AUTO_LEARNED_MAP_CLEANING_ENABLED = True
 AUTO_MAP_COMPLETE_MIN_TIME_SEC = 118.0

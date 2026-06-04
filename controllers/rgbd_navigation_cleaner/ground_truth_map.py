@@ -184,6 +184,66 @@ def build_ground_truth_grid(
     return grid.astype(np.bool_), drawn
 
 
+def _crop_bounds(mask, pad: int):
+    ys, xs = np.where(mask)
+    if xs.size == 0:
+        return None
+    h, w = mask.shape
+    x0 = max(0, int(xs.min()) - pad)
+    x1 = min(w, int(xs.max()) + pad + 1)
+    y0 = max(0, int(ys.min()) - pad)
+    y1 = min(h, int(ys.max()) + pad + 1)
+    return y0, y1, x0, x1
+
+
+def save_ground_truth_png(gt_grid, path, pad: int = 24) -> bool:
+    """Save the static ground-truth obstacle map as a PNG (dark = obstacle)."""
+    if cv2 is None:
+        return False
+    gt = np.asarray(gt_grid, dtype=bool)
+    bounds = _crop_bounds(gt, pad)
+    if bounds is None:
+        return False
+    y0, y1, x0, x1 = bounds
+    crop = gt[y0:y1, x0:x1]
+    img = np.full((crop.shape[0], crop.shape[1], 3), 245, dtype=np.uint8)
+    img[crop] = (60, 60, 60)
+    cv2.putText(img, "ground truth (from .wbt)", (8, 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 1, cv2.LINE_AA)
+    cv2.imwrite(str(path), img)
+    return True
+
+
+def save_comparison_png(robot_obstacles, gt_grid, path, evaluation_mask=None, pad: int = 24) -> bool:
+    """Save an overlay of the learned obstacle map vs ground truth.
+
+    Colours (BGR): grey = correct obstacle (true positive), red = false-occupied
+    (robot says obstacle, truly free), blue = false-free (robot missed a real
+    obstacle).  Restricted to ``evaluation_mask`` (explored cells) when given.
+    """
+    if cv2 is None:
+        return False
+    robot = np.asarray(robot_obstacles, dtype=bool)
+    gt = np.asarray(gt_grid, dtype=bool)
+    if evaluation_mask is not None:
+        m = np.asarray(evaluation_mask, dtype=bool)
+        robot = robot & m
+    bounds = _crop_bounds(gt | robot, pad)
+    if bounds is None:
+        return False
+    y0, y1, x0, x1 = bounds
+    r = robot[y0:y1, x0:x1]
+    g = gt[y0:y1, x0:x1]
+    img = np.full((r.shape[0], r.shape[1], 3), 245, dtype=np.uint8)
+    img[r & g] = (110, 110, 110)      # true positive  - grey
+    img[(~r) & g] = (200, 90, 0)      # false free      - blue (missed)
+    img[r & (~g)] = (0, 0, 220)       # false occupied  - red
+    cv2.putText(img, "grey=ok  red=false-occupied  blue=missed", (8, 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (20, 20, 20), 1, cv2.LINE_AA)
+    cv2.imwrite(str(path), img)
+    return True
+
+
 def false_cell_metrics(robot_obstacles, gt_obstacles, evaluation_mask=None) -> Dict:
     """Compare the learned obstacle mask against the ground-truth reference.
 
