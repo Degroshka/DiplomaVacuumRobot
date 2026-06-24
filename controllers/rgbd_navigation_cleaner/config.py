@@ -22,6 +22,13 @@ ORB_DEBUG_UPDATE_STEPS = 8
 WINDOW_UPDATE_STEPS = 30
 DEBUG_PRINT_INTERVAL_SEC = 18.0
 DEBUG_VERBOSE_CONSOLE = False
+# Per-run debug log file (Notepad-friendly .txt next to the controller). Truncated on
+# every startup, so each run leaves one fresh full-detail trace. It logs the VERBOSE
+# telemetry line (far richer than the compact console line) plus extra counts, written
+# every DEBUG_LOG_INTERVAL_SEC (more often than the console).
+DEBUG_LOG_TO_FILE = True
+DEBUG_LOG_FILE_NAME = "debug_log.txt"
+DEBUG_LOG_INTERVAL_SEC = 4.0
 PERF_PROFILER_ENABLED = True
 PERF_EMA_ALPHA = 0.18
 PERF_DEBUG_INCLUDE = ("loop", "io", "clean", "depthMap", "cv", "under", "struct", "planner", "noise", "fp", "segment", "render")
@@ -102,12 +109,22 @@ ACTIVE_SCAN_COOLDOWN_SEC = 95.0
 ACTIVE_SCAN_SPATIAL_COOLDOWN_M = 2.15
 ACTIVE_SCAN_YAW_OFFSETS_DEG = (0, -32, 32, 0)
 ACTIVE_SCAN_TOLERANCE_DEG = 3.0
-ACTIVE_SCAN_DWELL_SEC = 0.42
+# Bumped 0.42 -> 0.55 so that after the new settle delay there is still a clean
+# stationary mapping window of ~0.3s per yaw (the robot coasts for the first ~0.12s
+# after hitting the yaw, which is now excluded from fusion).
+ACTIVE_SCAN_DWELL_SEC = 0.55
 ACTIVE_SCAN_TIMEOUT_SEC = 5.8
 ACTIVE_SCAN_TURN_KP = 2.00
 ACTIVE_SCAN_TURN_MIN_SPEED = 0.34
 ACTIVE_SCAN_TURN_MAX_SPEED = 0.82
 ACTIVE_SCAN_DWELL_MAP_MIN_REMAIN_SEC = 0.08
+# (2) Settle-before-fuse: don't map the dwell ENTRY (robot still coasting from the
+# turn); only start fusing once it has held the target yaw this long.
+ACTIVE_SCAN_DWELL_SETTLE_SEC = 0.12
+# (1) Strict still-gate for scan-dwell fusion (vs the global TURN_MAPPING_OMEGA_LIMIT
+# of 0.12): only fuse a dwell frame when residual rotation is truly small (~3.4 deg/s),
+# so leftover coast after the turn cannot smear the point cloud.
+ACTIVE_SCAN_DWELL_OMEGA_LIMIT = 0.06
 POST_TURN_RGBD_SNAPSHOT_ENABLED = True
 POST_TURN_RGBD_SNAPSHOT_SETTLE_SEC = 0.22
 POST_TURN_RGBD_SNAPSHOT_CAPTURE_SEC = 0.72
@@ -129,7 +146,11 @@ HYBRID_LOCAL_MOTION_RESTORE_ENABLED = True
 # already computed and passes safety checks, commit it instead of continuing
 # ROW_FORWARD — prevents the robot from ignoring a visible nearby frontier.
 EXPLORATION_FRONTIER_HYBRID_SHORT_COMMIT_ENABLED = True
+<<<<<<< HEAD
 EXPLORATION_FRONTIER_HYBRID_SHORT_COMMIT_MAX_COST_M = 1.80
+=======
+EXPLORATION_FRONTIER_HYBRID_SHORT_COMMIT_MAX_COST_M = 3.00  # Round 6w: 1.80->3.00. Below this the robot only "drove forward" (frontier-direct/holdDrive = raw forward, lots of wall bouncing) toward far frontiers instead of committing the planned wavefront route; 3.0m lets medium frontier routes commit (safety still gated by coverage_candidate_is_committable)
+>>>>>>> brave-merkle-main
 # Obstacle-boundary vantage frontiers (kind=4 "obs-boundary"):
 # When an obstacle cluster has unexplored gray cells on its sides, generate
 # vantage targets just outside the cluster so the robot navigates there to
@@ -139,9 +160,24 @@ OBS_BOUNDARY_FRONTIER_MIN_CLUSTER_CELLS = 80
 OBS_BOUNDARY_FRONTIER_MIN_ADJACENT_UNKNOWN = 30
 OBS_BOUNDARY_FRONTIER_APPROACH_M = 0.28
 OBS_BOUNDARY_FRONTIER_MIN_LOCAL_CELLS = 8
+<<<<<<< HEAD
 OBS_BOUNDARY_FRONTIER_REWARD = 9.5
 OBS_BOUNDARY_FRONTIER_BONUS_SCALE = 0.04
 OBS_BOUNDARY_FRONTIER_BONUS_MAX = 5.0
+=======
+# Round 6s: obstacle-inspection vantage as a first-class EXPLORATION target.  Until now
+# kind=4 (vantage beside an obstacle with unseen faces) was discarded during frontier
+# exploration (planner kept only kind=2), so the robot never diverted to map/fill
+# furniture and just chased open frontiers along walls.  These rewards are raised to be
+# competitive with frontier scores and a close-bonus makes the robot divert to a NEARBY
+# obstacle (without crossing the room for a far one).  Set the flag False to revert.
+OBS_BOUNDARY_FRONTIER_EXPLORATION_TARGET = True
+OBS_BOUNDARY_FRONTIER_REWARD = 26.0        # was 9.5 (uncompetitive vs frontier base 21 + bonuses)
+OBS_BOUNDARY_FRONTIER_BONUS_SCALE = 0.06   # was 0.04; bonus grows with nearby unseen-obstacle-boundary cells
+OBS_BOUNDARY_FRONTIER_BONUS_MAX = 16.0     # was 5.0
+OBS_BOUNDARY_FRONTIER_CLOSE_BONUS = 28.0   # proximity bonus, full when adjacent, 0 at NEAR_RADIUS (LOCAL_FIRST pattern)
+OBS_BOUNDARY_FRONTIER_NEAR_RADIUS_M = 1.6  # divert to obstacle only when within this range
+>>>>>>> brave-merkle-main
 OBS_BOUNDARY_FRONTIER_MIN_COVERAGE_PERCENT = 28.0
 EXPLORATION_FRONTIER_SINGLE_POINT_COMMIT_ENABLED = True
 EXPLORATION_FRONTIER_SINGLE_POINT_MAX_COST_M = 0.90
@@ -168,6 +204,16 @@ EXPLORATION_FRONTIER_ONLY_STALL_WATCHDOG_ENABLED = True
 # a stationary robot (owner=NONE) this long with no committable route, instead of
 # standing still until the slower blacklist/dock escalation fires.
 EXPLORATION_FRONTIER_ONLY_HOLD_RELEASE_SEC = 15.0
+<<<<<<< HEAD
+=======
+# Kill-the-hold: when a frontier candidate has a route that is NOT committable,
+# the gate used to FREEZE owner=NONE and wait (relying on snapshots/hold-release).
+# That produced the long scan/snapshot/hold churn with cov frozen.  Instead, hand
+# motion to ROW_FORWARD so the robot keeps driving and gathering RGB-D evidence
+# (and leaves the dead spot); the progress governor + blacklist still redirect it.
+# Periodic perception snapshots above this still fire.  Set False to restore hold.
+EXPLORATION_FRONTIER_ONLY_HOLD_DRIVE_INSTEAD = True
+>>>>>>> brave-merkle-main
 EXPLORATION_FRONTIER_ONLY_STALL_TIMEOUT_SEC = 12.0
 EXPLORATION_FRONTIER_ONLY_STALL_POSE_EPS_M = 0.07
 EXPLORATION_FRONTIER_ONLY_STALL_HEADING_EPS_RAD = math.radians(18.0)
@@ -175,12 +221,25 @@ EXPLORATION_FRONTIER_ONLY_STALL_HEADING_EPS_RAD = math.radians(18.0)
 # map coverage has not grown.  Catches the "washing machine" loop where recovery
 # maneuvers (CONTACT_BACKUP / GRID_REALIGN) continuously reset the pose-based
 # stall timer while the robot bounces in a blocked frontier zone.
+<<<<<<< HEAD
 EXPLORATION_FRONTIER_ONLY_STALL_COV_GAIN_PERCENT = 0.35
+=======
+# Require a MEANINGFUL coverage gain to reset the coverage-stall timer.  The
+# right-obstacle camp creeps coverage up in +0.2/+0.4% steps that kept resetting
+# the old 0.35% threshold, so the "washing-machine" watchdog never matured and
+# the robot ground on the same obstacle for minutes.  0.50% ignores that creep.
+EXPLORATION_FRONTIER_ONLY_STALL_COV_GAIN_PERCENT = 0.50
+>>>>>>> brave-merkle-main
 EXPLORATION_FRONTIER_ONLY_STALL_COV_TIMEOUT_SEC = 55.0
 EXPLORATION_FRONTIER_ONLY_STALL_RETURN_TIMEOUT_SEC = 46.0
 EXPLORATION_FRONTIER_ONLY_STALL_RETURN_MIN_COVERAGE_PERCENT = 47.5
-EXPLORATION_FRONTIER_ONLY_STALL_BLACKLIST_RADIUS_M = 0.68
-EXPLORATION_FRONTIER_ONLY_STALL_BLACKLIST_SEC = 95.0
+# Bite: when the watchdog blacklists a camped region (e.g. the right obstacle's
+# unresolvable hidden face that yields scan=nogain forever), the suppression must
+# be wide and long enough that the robot is actually pushed off to map the real
+# interior, instead of stepping just outside a small disc and re-approaching the
+# same face.  0.68m/95s was too weak for a multi-cell obstacle silhouette.
+EXPLORATION_FRONTIER_ONLY_STALL_BLACKLIST_RADIUS_M = 1.05
+EXPLORATION_FRONTIER_ONLY_STALL_BLACKLIST_SEC = 200.0
 EXPLORATION_FRONTIER_ONLY_STALL_MAX_BLACKLISTS_BEFORE_DOCK = 4
 
 # Late map-completion priority: when the map still contains coherent unknown
@@ -209,8 +268,21 @@ COMPLETION_PRIORITY_STALL_DOCK_BLOCK_CELLS = 420
 # important completion/gray pockets remain elsewhere.  This is a scoring penalty
 # only; it does not change the online map or remove true walls/obstacles.
 RIGHT_WALL_REPEAT_SUPPRESS_ENABLED = True
+<<<<<<< HEAD
 RIGHT_WALL_REPEAT_SUPPRESS_MIN_COVERAGE_PERCENT = 36.0
 RIGHT_WALL_REPEAT_SUPPRESS_MIN_GRAY_CELLS = 650
+=======
+# Engage the wall-repeat penalty EARLY.  The robot was pacing the right wall up/down
+# at cov~31% (nearest committable frontiers are the beyond-the-wall ghosts right next
+# to it) instead of committing to the large unexplored LEFT half.  The penalty only
+# applies to a RE-visited edge band near the robot, so first-pass exploration is not
+# punished; lowering the coverage gate just lets it redirect to the far frontier
+# sooner.  The gray gate was the wrong proxy here (the unexplored left is frontier,
+# not interior gray), so drop it to 0.  Pure scoring nudge — does not touch hypObs,
+# planning masks, or walls.
+RIGHT_WALL_REPEAT_SUPPRESS_MIN_COVERAGE_PERCENT = 24.0
+RIGHT_WALL_REPEAT_SUPPRESS_MIN_GRAY_CELLS = 0
+>>>>>>> brave-merkle-main
 RIGHT_WALL_REPEAT_SUPPRESS_EDGE_BAND_M = 1.10
 RIGHT_WALL_REPEAT_SUPPRESS_RECENT_RATIO = 0.18
 RIGHT_WALL_REPEAT_SUPPRESS_PENALTY = 42.0
@@ -219,17 +291,80 @@ RIGHT_WALL_REPEAT_SUPPRESS_NEAR_ROBOT_M = 2.25
 FRONTIER_FALLBACK_DIRECT_ROUTE_ENABLED = True
 FRONTIER_FALLBACK_DIRECT_MAX_BLOCKED_RATIO = 0.16
 FRONTIER_FALLBACK_DIRECT_MAX_DIST_M = 1.55
+# Step 1 — frontier reachability filter.  The fallback target chooser runs only
+# when the wavefront planner found NO route.  It could still commit
+# coverage_goal_map to a frontier with no direct route (direct_ok False), so the
+# robot fixated on an unreachable frontier and looped scan/grid-realign forever
+# with cov frozen.  In fallback, "no wavefront route AND no clear direct line" =
+# unreachable now: do not commit it — blacklist it briefly so the next planner
+# cycle picks a different, reachable frontier.  Toggle off to restore old fixate.
+FRONTIER_REACHABILITY_FILTER_ENABLED = True
+FRONTIER_UNREACHABLE_BLACKLIST_SEC = 30.0
+FRONTIER_UNREACHABLE_BLACKLIST_RADIUS_M = 0.40
 ACTIVE_SCAN_AREA_MEMORY_ENABLED = True
 ACTIVE_SCAN_AREA_TILE_M = 1.15
 ACTIVE_SCAN_AREA_REPEAT_SUPPRESS_SEC = 300.0
 ACTIVE_SCAN_AREA_MEMORY_MAX = 24
+# Scan-abort loop breaker.  When GRID_REALIGN / recovery preempts a SCAN_AROUND
+# before it completes, the tile is otherwise never remembered (remember_active_
+# scan_area runs only on finish), so the same scan restarts in place:
+#   scan=start -> dwell 2/4 -> GRID_REALIGN -> scan=start  (deadlock, pose fixed)
+# On abort: mark the tile, hard-suppress it briefly (completion-priority does NOT
+# bypass this, unlike the normal area cooldown), and after repeated aborts in the
+# same tile blacklist the current target so the planner replans to another goal.
+ACTIVE_SCAN_ABORT_LOOP_GUARD_ENABLED = True
+ACTIVE_SCAN_ABORT_SUPPRESS_SEC = 28.0
+ACTIVE_SCAN_ABORT_BLACKLIST_AFTER = 2
+ACTIVE_SCAN_ABORT_BLACKLIST_SEC = 45.0
+ACTIVE_SCAN_ABORT_BLACKLIST_RADIUS_M = 0.90
+# No-gain scan suppression.  A completed scan that revealed essentially no new
+# local unknown area is useless; but completion-priority would re-force it in the
+# same tile (it bypasses the normal area cooldown), giving the scan<->hard-corner
+# GRID_REALIGN loop with cov frozen and add=0.  When a finished scan's local
+# unknown did not drop by at least MIN_UNKNOWN_DROP cells, hard-suppress the tile
+# via the abort memory (completion CANNOT bypass that), and after repeats
+# blacklist the frontier target so the planner moves elsewhere.
+ACTIVE_SCAN_NOGAIN_SUPPRESS_ENABLED = True
+ACTIVE_SCAN_NOGAIN_MIN_UNKNOWN_DROP = 40
+# Global progress governor (anti-freeze).  One regime-independent rule that
+# subsumes every stuck mode we have seen (scan loop, frontier-only hold,
+# unreachable fixate, wall pin): they ALL share one signature -- robot pose AND
+# coverage are frozen while a goal is held.  Detect that once and abandon the
+# goal (blacklist its neighbourhood + force replan), regardless of nav_state,
+# regime, or which narrow watchdog would otherwise apply.  Progress is the only
+# currency: make progress or drop the goal.  After repeated freezes the map is
+# effectively exhausted -> return to dock.
+GLOBAL_PROGRESS_GOVERNOR_ENABLED = True
+PROGRESS_GOV_POSE_EPS_M = 0.18
+PROGRESS_GOV_COV_GAIN_PERCENT = 0.4
+PROGRESS_GOV_STALL_SEC = 26.0
+PROGRESS_GOV_BLACKLIST_SEC = 40.0
+PROGRESS_GOV_BLACKLIST_RADIUS_M = 0.90
+PROGRESS_GOV_MAX_ESCALATIONS_BEFORE_DOCK = 6
+# Do NOT dock while the map is still open: if a large gray gap remains, the map
+# is not a closed room yet, so repeated freezes mean "stuck here", not "map
+# done".  Instead of docking, relocate: blacklist a wide area around the stuck
+# goal and force the planner to a far region.  Dock only when the gray gap is
+# small (map effectively closed) OR after this many relocation attempts failed
+# (the remaining gray is genuinely unreachable).
+PROGRESS_GOV_DOCK_MAX_GRAY_GAP_CELLS = 1800
+PROGRESS_GOV_RELOCATE_BLACKLIST_RADIUS_M = 1.6
+PROGRESS_GOV_RELOCATE_BLACKLIST_SEC = 90.0
+PROGRESS_GOV_MAX_RELOCATIONS_BEFORE_DOCK = 4
 ACTIVE_SCAN_MIN_FRONTIER_GAIN_CELLS = 120
 ACTIVE_SCAN_MIN_UNKNOWN_GAIN_CELLS = 220
 EXPLORE_LOCK_CLEANUP_TARGETS_ENABLED = True
 EXPLORE_CLEANUP_UNLOCK_MIN_COVERAGE_PERCENT = 68.0
 EXPLORE_CLEANUP_UNLOCK_MIN_TIME_SEC = 180.0
 EXPLORE_CLEANUP_UNLOCK_MAX_FRONTIER_CELLS = 900
-EXPLORE_CLEANUP_UNLOCK_MAX_FRONTIER_RATIO = 0.030
+# Round 6m: ratio-branch disabled (was 0.030).  The unlock OR'd this ratio with the
+# absolute MAX_FRONTIER_CELLS gate, but as the map grows the cleanable denominator
+# inflates, so 3% = ~12.7k cells — the overnight run unlocked to uncleaned-chasing with
+# fr=10396 (>>900) because ratio=0.0246<=0.030.  That made the robot spend ~64% of the
+# run driving over already-mapped floor (coverage) instead of mapping frontiers.  With
+# 0.0 the ratio branch is inert and unlock requires the absolute frontiers<=900 gate, so
+# EXPAND_MAP stays frontier-first until frontiers are genuinely exhausted.
+EXPLORE_CLEANUP_UNLOCK_MAX_FRONTIER_RATIO = 0.0
 EXPLORATION_FRONTIER_ROUTING_ENABLED = True
 EXPLORATION_ROUTE_CLEANED_TRANSIT_PENALTY = 0.0
 EXPLORATION_ROUTE_RECENT_TRANSIT_PENALTY = 0.10
@@ -361,9 +496,16 @@ EXPLORATION_ROUTE_EXTRA_CORNER_PENALTY = 2.75
 EXPLORATION_ROUTE_MAX_SOFT_CORNERS = 3
 EXPLORATION_FRONTIER_ROW_PRIMARY_ENABLED = True
 EXPLORATION_FRONTIER_ROW_PRIMARY_FRONT_CLEAR_M = 0.42
-EXPLORATION_FRONTIER_ROW_PRIMARY_MAX_FIRST_TURN_FRAC = 0.24
+EXPLORATION_FRONTIER_ROW_PRIMARY_MAX_FIRST_TURN_FRAC = 0.45  # Round 6p: 0.24->0.45 so a side/interior frontier wins over plowing the row
 EXPLORATION_FRONTIER_ROW_PRIMARY_MAX_CORNERS = 3
-EXPLORATION_FRONTIER_POINT_PURSUIT_ENABLED = True
+# Frontier exploration motion mode.
+#   True  = pure-pursuit: continuously steer toward the next waypoint (smooth arcs
+#           => wobbly, curved tracks; this was the main "dergonoe" motion source).
+#   False = Manhattan segment follow: align once to the 4-connected route's cardinal
+#           heading, drive straight, pivot in place only at real corners.
+# The route planner is 4-connected, so False yields clean straight lines + 90deg
+# turns for the whole mapping traversal. Set True to restore the legacy wobble (A/B).
+EXPLORATION_FRONTIER_POINT_PURSUIT_ENABLED = False
 EXPLORATION_FRONTIER_PIVOT_ERR = math.radians(42.0)
 EXPLORATION_FRONTIER_STEER_ERR = math.radians(7.5)
 EXPLORATION_FRONTIER_STEER_KP = 1.55
@@ -467,7 +609,11 @@ TURN_FREEZE_HOLD_SEC = 0.25
 # mapping when driving forward with a large enough arc radius; set ENABLED False
 # to restore the strict freeze.
 FORWARD_ARC_MAPPING_ENABLED = True
+<<<<<<< HEAD
 FORWARD_ARC_MAPPING_MIN_LINEAR_MPS = 0.10
+=======
+FORWARD_ARC_MAPPING_MIN_LINEAR_MPS = 0.08
+>>>>>>> brave-merkle-main
 FORWARD_ARC_MAPPING_MIN_RADIUS_M = 0.40
 TURN_OCC_MAX_RANGE = 0.70
 TURN_FREE_MAX_RANGE = 0.00
@@ -1176,6 +1322,14 @@ RECENT_VISIT_ROUTE_PENALTY = 1.85
 RECENT_VISIT_TARGET_PENALTY = 10.5
 RECENT_VISIT_TARGET_SOFT_BLOCK = 0.78
 RECENT_VISIT_LOW_VALUE_EPS = 0.05
+# Round 6n: weight of the recently-visited-area penalty for FRONTIER targets (kind_code 2).
+# Was a hardcoded 0.25 in plan_best_coverage_route, i.e. recency for frontiers maxed at
+# 0.25*10.5=2.6 against frontier scores of ~150-180 — effectively off, so the robot kept
+# re-picking the same nearby thrashed frontier cluster (explored plateaued at 92%, 8 blacklists,
+# no unknown-collapse).  Frontier near-vs-far differs by ~5.2/m * dcost ~= 8-13 pts; this scale is
+# sized so a thrashed cell (recent_target~0.5-0.8) costs ~8-17 pts and loses to a fresh far
+# frontier.  uncleaned targets keep the full (1.0) recency penalty at line ~10281.
+EXPLORATION_FRONTIER_RECENT_VISIT_PENALTY_SCALE = 1.5
 FRONT_NARROW_FRACTION = 0.16
 ROW_END_CONFIRM_FRAMES = 11
 ROW_END_CONFIRM_DISTANCE = 0.105
@@ -1258,6 +1412,12 @@ MAP_MATURE_COVERAGE_PERCENT = 62.0
 MAP_MATURE_MIN_TIME_SEC = 110.0
 MAP_MATURE_TIME_COVERAGE_PERCENT = 48.0
 MAP_MATURE_MAX_FRONTIER_RATIO = 0.055
+# The timeout maturity path looks only at the BOUNDARY frontier ratio, so it can
+# declare the map "mature" while a large INTERIOR gray gap is still open (the room
+# is not actually closed).  Block the timeout path while the gray gap exceeds
+# this; the high-coverage path is unaffected.  The progress governor still docks
+# eventually if that gray is genuinely unreachable.
+MAP_MATURE_MAX_GRAY_GAP_CELLS = 2500
 MAP_MATURE_MIN_CLEANABLE_CELLS = 1800
 ROUTE_COMMIT_MIN_COVERAGE_PERCENT = 55.0
 ROUTE_COMMIT_MAX_ROUTE_COST_M = 2.35
@@ -1328,11 +1488,27 @@ WALL_TRAP_FRONTIER_BLACKLIST_SEC = 120.0
 WALL_TRAP_FRONTIER_ZONE_COV_GAIN_PERCENT = 0.4
 WALL_TRAP_FRONTIER_ZONE_BLACKLIST_RADIUS_M = 1.2
 WALL_TRAP_FRONTIER_ZONE_MAX_ACTIONS = 2
+<<<<<<< HEAD
+=======
+# Round 6o: once the room has closed, the wall-trap watchdog resets on real mapping
+# progress (interior gray shrinking) instead of coverage growth.  Driving up/down an
+# occluded wall strip cleans floor (coverage +0.4% -> old cov-gain reset) while mapping
+# nothing (gray flat because the cells are behind an obstacle), which kept resetting the
+# trap and let the robot oscillate.  Reset only if gray drops by at least this many cells.
+WALL_TRAP_FRONTIER_ZONE_GRAY_DROP_CELLS = 300
+>>>>>>> brave-merkle-main
 DOCK_STOP_HOLD_OWNER_SEC = 9999.0
 # Map-only mission: when False the robot still explores and returns to the dock,
 # but it STOPS there instead of starting the learned-map K cleaning / coverage
 # route phase.  Set False to focus purely on building the map.
 AUTO_LEARNED_MAP_CLEANING_ENABLED = False
+<<<<<<< HEAD
+=======
+# Map-only mission: when the robot finishes exploring and parks on the dock,
+# automatically write the occupancy + coverage maps (and metrics) to disk, so the
+# mission ends with a saved map without needing the manual 'S' keypress.
+AUTO_SAVE_MAP_ON_DOCK = True
+>>>>>>> brave-merkle-main
 AUTO_MAP_COMPLETE_MIN_TIME_SEC = 118.0
 AUTO_MAP_COMPLETE_MIN_COVERAGE_PERCENT = 47.0
 AUTO_MAP_COMPLETE_STRONG_COVERAGE_PERCENT = 54.0
@@ -1351,6 +1527,24 @@ AUTO_MAP_COMPLETE_ARENA_GATE_ENABLED = True
 AUTO_MAP_COMPLETE_MIN_ARENA_KNOWN_RATIO = 0.54
 AUTO_MAP_COMPLETE_MIN_BOTTOM_BAND_KNOWN_RATIO = 0.30
 AUTO_MAP_COMPLETE_BOTTOM_BAND_M = 0.85
+# Frontier interior clip: drop frontiers that sit in the unknown background OUTSIDE
+# the observed room envelope (beyond the walls). The base frontier is "unknown next
+# to free floor", which also fires along the wall line pointing OUT of the room, so
+# the robot chases unreachable ghost frontiers, camps the wall, loops forever and
+# never finishes the map. The room envelope is taken from sensor evidence only (free
+# floor + obstacles), NOT the known arena rectangle. Gated on coverage so early
+# outward exploration is not blocked. CLOSE_M bridges small unmapped wall gaps so the
+# flood does not leak out (a real doorway wider than ~2*CLOSE_M is still explored).
+FRONTIER_INTERIOR_CLIP_ENABLED = True
+# Primary gate = loop closure, NOT coverage %. Coverage is cleaned / KNOWN-floor, and the
+# known floor grows as we explore, so the % is relative to a moving denominator and cannot
+# tell us how much map is left. Instead: once the observed free-floor+obstacle ring encloses
+# at least this much interior area (the gray middle the border-flood cannot reach), the room
+# has "closed" -> latch it and keep the clip on. Below closure, frontiers stay unrestricted
+# so the robot keeps expanding outward to actually close the room.
+FRONTIER_ROOM_CLOSED_MIN_AREA_M2 = 3.0
+FRONTIER_INTERIOR_CLIP_MIN_COVERAGE = 25.0   # low safety floor only; closure is the real gate
+FRONTIER_INTERIOR_CLIP_CLOSE_M = 0.30
 GRAY_REVISIT_ENABLED = True
 GRAY_REVISIT_MIN_COMPONENT_CELLS = 55
 GRAY_REVISIT_MAX_COMPONENT_CELLS = 15000
@@ -1364,24 +1558,134 @@ GRAY_REVISIT_MIN_CLEANABLE_EDGE_CELLS = 28
 GRAY_REVISIT_MIN_CLEANABLE_EDGE_RATIO = 0.16
 GRAY_REVISIT_MAX_OBSTACLE_EDGE_RATIO = 0.50
 GRAY_REVISIT_OBSTACLE_SHADOW_RATIO = 1.35
+# A gray component is treated as a furniture *shadow* (unseen object interior to be
+# walled off) only when its boundary is obstacle-dominated AND it is bounded in size.
+# Larger gray patches are unexplored floor pockets: keep them explorable as frontiers
+# instead of fencing them off. Set <=0 to fall back to the legacy low-clean heuristic.
+GRAY_REVISIT_SHADOW_MAX_AREA_RATIO = 0.60
+GRAY_REVISIT_SHADOW_REQUIRE_OBSTACLE_EDGE = True
 OBSTACLE_HYPOTHESIS_ENABLED = True
 OBSTACLE_HYPOTHESIS_UPDATE_STEPS = 14
 OBSTACLE_HYPOTHESIS_OCC_EPS = 0.85
 OBSTACLE_HYPOTHESIS_MAX = 4.0
 OBSTACLE_HYPOTHESIS_DECAY = -0.055
 OBSTACLE_HYPOTHESIS_FREE_CLEAR_LO = -2.25
+# Shape completion excludes "already observed free" interior from being painted as
+# obstacle, so the fill never covers real floor.  But the exclusion threshold must
+# be MODERATE, not the barely-free unknown epsilon: a single grazing depth ray near
+# an obstacle pushes interior cells just below -LO_UNKNOWN_EPS (-0.18), which used to
+# permanently disqualify the whole silhouette from filling.  Once the robot stopped
+# camping and started driving all the way around obstacles (Round 6), every interior
+# got grazed -> obstacles went hollow ("перестал закрашивать препятствия").  Require
+# the cell to be CONFIDENTLY free (repeated/strong observation) before excluding it;
+# weak/noisy grazing free still fills as obstacle interior.  cleaned floor + strong
+# free are still excluded, so this does not re-open the old over-fill.
+# REVERTED to the good-path value.  Rounds 6c–6f widened this (and the gates below)
+# to fix the DISPLAY, but the hypothesis layer is ALSO read by the planner
+# (frontier_unknown = unknown & ~hyp_shadow, and closure's known |= hypObs), so
+# inflating it perturbed frontier selection / path.  Display is now handled by the
+# separate deterministic body fill (build_obstacle_body_fill), so the inference
+# layer is restored to its small, planning-safe form.
+OBSTACLE_HYPOTHESIS_OBSERVED_FREE_LO = -0.18
 OBSTACLE_HYPOTHESIS_MIN_COMPONENT_CELLS = 18
+# Never-filled obstacles.  Two gates were silently rejecting whole obstacles the user
+# can clearly see outlined in black points:
+#  - a big piece of furniture (e.g. the bottom-left rectangle) exceeds the old span /
+#    area caps and is dropped as "too big, probably a wall" -> raise the caps.  Walls
+#    are still excluded separately by the arena-wall-touch + map-edge test, so this
+#    does not start filling the room perimeter.
+#  - the morphological CLOSE kernel was BOX_PAD_M=0.055m (~3px), too small to bridge
+#    the gaps between SPARSE studded points, so a 4-sided ring of dots never became a
+#    single connected island with an enclosed interior -> it never qualified.  A wider
+#    close (~7px) bridges the studs so the silhouette connects and its interior fills.
 OBSTACLE_HYPOTHESIS_MAX_COMPONENT_CELLS = 3600
 OBSTACLE_HYPOTHESIS_MAX_SPAN_M = 1.85
 OBSTACLE_HYPOTHESIS_BOX_PAD_M = 0.055
 OBSTACLE_HYPOTHESIS_MIN_SIDE_SUPPORT = 4
 OBSTACLE_HYPOTHESIS_MIN_SIDE_COUNT = 3
+# Qualify gate, NOT a fill mask: an obstacle island is rejected outright if more
+# than this fraction of its bbox reads observed-free.  At 0.10 a low/thin obstacle
+# standing on open floor (grazed by depth rays from the sides) keeps flunking the
+# gate, so its fill drops out and re-appears tick to tick (the flicker the user
+# sees).  Raise it so a grazed obstacle still qualifies.  Safe because the fill is
+# still only `roi_unknownish` (unknown cells) — qualifying never paints real floor.
 OBSTACLE_HYPOTHESIS_MAX_FREE_RATIO = 0.10
 OBSTACLE_HYPOTHESIS_MIN_FILL_CELLS = 8
 OBSTACLE_HYPOTHESIS_SHADOW_UPDATE = 0.72
+# One-shot stickiness (flicker root cause).  At 1.10 a cell that only qualifies for
+# shape-completion INTERMITTENTLY (a big obstacle whose free_ratio crosses the gate
+# tick-to-tick) never climbs above the sticky-keep floor (2.5): it gets +1.10, decays
+# before the next qualify, gets +1.10 again... so it lives in the maskable [0.85,2.5]
+# band and blinks on/off with every grazing free ray.  Jumping straight to MAX on a
+# single qualification makes the cell sticky immediately, so it stops flickering; the
+# free-clear still erodes it from MAX over ~9 sustained-free recomputes if it is truly
+# floor.  (A stable island already reached MAX after ~4 adds — that is why the first
+# obstacle never flickered while later ones did.)
 OBSTACLE_HYPOTHESIS_SHAPE_UPDATE = 1.10
-OBSTACLE_HYPOTHESIS_NO_GO_IN_PLANNING = True
+# Stickiness: a cell whose accumulated hypothesis log-odds is at least this strong
+# is NOT hidden just because the base occupancy momentarily reads strong-free.  This
+# is what stops the fill from blinking off for a tick every time a depth ray grazes
+# a low/thin obstacle (the base flips < FREE_CLEAR_LO for one frame).  A cell only
+# reaches this by being re-shape-completed several times (SHAPE_UPDATE=1.10 each), so
+# noise stamps never stick; and the gentle free-clear still drives genuinely-free
+# cells back below it over a few seconds, so sustained free still wins (honesty).
+OBSTACLE_HYPOTHESIS_STICKY_KEEP_LO = 2.5
+OBSTACLE_HYPOTHESIS_UNKNOWN_DECAY_MULT = 2.0
+# MAPPING mission: do NOT let inferred/hallucinated obstacle interiors (the orange
+# hypothesis layer) block the planner.  The mission is to map *observed* reality, and
+# the shape-completion path was stamping a persistent ~626-cell phantom obstacle from
+# t=18s that inflated noGo and fenced the planner.  hypObs is kept as a visual overlay
+# (still drawn) but is no longer a hard no-go.  Set True to restore the old behavior.
+OBSTACLE_HYPOTHESIS_NO_GO_IN_PLANNING = False
 OBSTACLE_HYPOTHESIS_DRAW_LABELS = True
+
+# --- Deterministic obstacle BODY fill (display only) ----------------------------
+# The speculative hypothesis log-odds layer above accumulates/decays per recompute,
+# which made the orange obstacle fill flicker and miss large/sparse obstacles no
+# matter how the thresholds were tuned.  Because hypObs is visual-only in this
+# mapping mission (NO_GO_IN_PLANNING=False), the obstacle *body* shown on the maps is
+# instead rebuilt geometrically every frame from CONFIRMED obstacle cells: bridge
+# sparse studded points (morphological close), then solid-fill the interior enclosed
+# by each bounded cluster.  Recomputed from confirmed evidence each render => no
+# decay, no flicker, and large/sparse silhouettes fill reliably.  Walls / room
+# perimeter are excluded per-component (span cap + arena-wall touch + map edge), and
+# confidently-free / cleaned cells are never painted, so it cannot bleed onto floor
+# or flood the room.  Set False to fall back to the raw hypothesis overlay.
+OBSTACLE_BODY_FILL_ENABLED = True
+OBSTACLE_BODY_FILL_CLOSE_M = 0.28          # Round 6t: 0.14->0.28. Obstacles arrive as sparse studded points (rawObs ~200, not dense silhouettes); a 0.14m (~7px) close left studs >14cm apart unconnected so almost nothing reached the 18-cell fill floor (bodyFill~64). 0.28m bridges studs into fillable bodies. Wall-touch + span cap + ~free/~cleaned still prevent painting walls/floor.
+OBSTACLE_BODY_FILL_MAX_SPAN_M = 4.5        # Round 6q: 2.6->4.5; real furniture (tables) exceed 2.6m and were dropped as "wall". Wall ring (~14-18m) still excluded by this cap + wall-touch + map-edge
+OBSTACLE_BODY_FILL_MIN_COMPONENT_CELLS = 18
+# Round 6l: fill PARTIAL silhouettes, not only fully-closed rings.  Use confidently-free
+# floor the robot drove around the obstacle as an extra flood barrier so the unknown
+# interior trapped between the seen faces and that floor is filled.  A lone unobserved
+# face stays connected to the open room and is never claimed.  False = legacy enclosed-
+# ring-only fill (the old behaviour that left every not-fully-circled object unpainted).
+OBSTACLE_BODY_FILL_FLOOR_BARRIER = True
+OBSTACLE_BODY_FILL_BARRIER_PAD_M = 0.30    # surrounding observed-free floor included to close a silhouette's open sides
+# Round 6t: complete each studded obstacle cluster to a standard PRIMITIVE (the tighter of
+# min-area-rectangle / min-enclosing-circle) and fill it solid.  Furniture is rectangular or
+# round, but RGB-D gives only a sparse studded outline with gray floor inside; fitting a
+# primitive reconstructs the implied body cleanly.  Falls back to flood fill when the fit
+# would land mostly on observed-free floor (a bad fit across open space).  Display only.
+OBSTACLE_BODY_FILL_FIT_PRIMITIVES = True
+OBSTACLE_BODY_FILL_FIT_MAX_FREE_RATIO = 0.55  # reject a fitted primitive if more than this fraction of it is confidently-free floor
+# Round 6u: gray-bridged geometric completion. A sparse studded outline fragments into arcs
+# and a big object's gray (unknown) interior stays unfilled. Let the interior gray itself
+# bridge the gaps: seed = obstacle points + unknown cells within a short radius of them, so
+# the whole object becomes ONE cluster; then fit + fill a rectangle/circle to the real points.
+# Implements "gray walled by points that looks like a figure = obstacle body". Display only.
+OBSTACLE_BODY_FILL_GRAY_BRIDGE = True
+OBSTACLE_BODY_FILL_GRAY_BRIDGE_M = 0.40       # close radius to bridge outline gaps in the obstacle POINTS (bounded). Round 6u-fix: was 0.55 + gray-dilation, which stitched noise through open gray into a giant phantom; now points-only close, gray used only as enclosed interior
+OBSTACLE_BODY_FILL_GRAY_MIN_EVIDENCE = 0.60   # keep a fitted figure only if its ENCLOSED body fills >= this fraction of the rect/circle (rejects phantom rects over scattered points in open space)
+# Round 6v: use the BLUE driveable floor (free + cleaned) as the obstacle boundary. The robot
+# drives free floor all around furniture, so each obstacle is a non-blue region ENCLOSED by blue
+# floor. Far more robust than fitting sparse outline points. Takes precedence over gray-bridge.
+# Guard against painting an unexplored pocket the path merely looped around: keep an enclosed
+# region only when its perimeter is lined with obstacle points (the robot actually sensed an
+# obstacle at the floor boundary), not just because it is surrounded by floor.
+OBSTACLE_BODY_FILL_FLOOR_ENCLOSED = True
+OBSTACLE_BODY_FILL_FLOOR_COVER_M = 0.30       # dilation radius to cluster perimeter studs into one obstacle (bridges sparse studs)
+OBSTACLE_BODY_FILL_FLOOR_MIN_PTS = 40         # min obstacle-points in the main cluster to accept a fill (drops small junk fills from a few scattered points)
 NEAR_COLLISION_HYPOTHESIS_ENABLED = True
 NEAR_COLLISION_HYPOTHESIS_MIN_COV_PERCENT = 24.0
 NEAR_COLLISION_HYPOTHESIS_FRONT_M = 0.34

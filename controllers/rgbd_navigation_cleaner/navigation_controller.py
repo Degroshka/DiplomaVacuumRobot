@@ -168,6 +168,25 @@ metrics_dir = out_dir / METRICS_DIR_NAME
 frames_dir.mkdir(exist_ok=True)
 maps_dir.mkdir(exist_ok=True)
 metrics_dir.mkdir(exist_ok=True)
+<<<<<<< HEAD
+=======
+# Per-run debug log: truncate on startup so every run is a fresh, full-detail trace.
+debug_log_file = None
+last_debug_log_time = -999.0
+if DEBUG_LOG_TO_FILE:
+    try:
+        debug_log_path = out_dir / DEBUG_LOG_FILE_NAME
+        debug_log_file = open(str(debug_log_path), "w", encoding="utf-8", buffering=1)
+        debug_log_file.write(
+            f"# RGB-D navigation debug log - run started {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"# verbose telemetry, one line per ~{DEBUG_LOG_INTERVAL_SEC:.0f}s; file is replaced each run\n"
+        )
+        print(f"Debug log -> {debug_log_path}")
+    except Exception as exc:
+        print(f"WARNING: could not open debug log file: {type(exc).__name__}: {exc}")
+        debug_log_file = None
+
+>>>>>>> brave-merkle-main
 metrics_session_name = f"metrics_{int(time.time())}"
 metrics_recorder = MetricsRecorder(metrics_dir, metrics_session_name, enabled=METRICS_ENABLED)
 metrics_last_sample_time = -999.0
@@ -554,6 +573,14 @@ active_scan_last_y = 1e9
 active_scan_start_frontier_local = 0
 active_scan_start_unknown_local = 0
 active_scan_area_memory = []
+active_scan_abort_memory = []
+progress_gov_anchor_x = 1e9
+progress_gov_anchor_y = 1e9
+progress_gov_anchor_cov = 0.0
+progress_gov_since = -999.0
+progress_gov_escalations = 0
+progress_gov_relocations = 0
+last_progress_gov_debug = "prog=init"
 last_active_scan_debug = "scan=idle"
 last_frontier_only_gate_debug = "frontierGate=idle"
 frontier_only_last_snapshot_at = -999.0
@@ -654,6 +681,10 @@ dock_stall_last_action_time = -999.0
 last_dock_stall_debug = "dockStall=init"
 wall_trap_anchor = None
 wall_trap_anchor_cov = 0.0
+<<<<<<< HEAD
+=======
+wall_trap_anchor_gray = 0
+>>>>>>> brave-merkle-main
 wall_trap_zone_actions = 0
 wall_trap_since = -999.0
 wall_trap_last_action_time = -999.0
@@ -670,7 +701,21 @@ last_side_strip_cleanup_reason = ""
 last_coverage_total_cells = 0
 last_coverage_cleaned_cells = 0
 last_coverage_percent = 0.0
+# Mapping (exploration) telemetry, distinct from cleaning coverage above:
+# coverage = driven-over floor (cleaned/cleanable); explored = how bounded/known the
+# current map is = known/(known+interiorUnknown), known = cleanable + obstacles.
+# These differ a lot because RGB-D maps cells from a distance without driving over them.
+last_room_enclosed_cells = 0
+last_coverage_obstacle_cells = 0
+# Right-wall-repeat-suppress activity counters, reset each route plan (telemetry only).
+right_wall_suppress_hits = 0
+right_wall_suppress_max_pen = 0.0
 last_frontier_cells = 0
+# Latched loop-closure flag: True once the observed free-floor+obstacle envelope has
+# enclosed a sizable interior (the room "closed").  Sensor-derived, never reset, used
+# to gate the beyond-the-wall frontier clip instead of a coverage percentage.
+frontier_room_closed = False
+last_frontier_room_closed_debug = "roomClosed=no"
 last_gray_gap_cells = 0
 last_gray_gap_components = 0
 last_gray_gap_debug = "grayGap=init"
@@ -1359,7 +1404,11 @@ def compact_debug_status_line():
         f"{runtime_arena_guard_debug[:24]} {odom_arena_clamp_debug[:22]} {frontier_route_abort_hold_debug[:24]} "
         f"{last_hypothesis_obstacle_debug[:28]} {last_near_collision_hypothesis_debug[:22]} {last_low_obstacle_memory_debug[:22]} "
         f"{last_leg_quad_debug[:32]} {last_wall_line_debug[:30]} plan={last_planning_layer_debug[:34]} "
+<<<<<<< HEAD
         f"scan={last_active_scan_debug[:28]} gate={last_frontier_only_gate_debug[:30]} occ={last_rgbd_occlusion_debug[:18]} {last_debug_viewer_status[:22]} {last_render_throttle_debug[:18]} {load_shedding_debug_text()[:24]} {metrics_last_debug[:22]} {last_dock_stall_debug[:24]} {last_wall_trap_debug[:26]}"
+=======
+        f"scan={last_active_scan_debug[:28]} gate={last_frontier_only_gate_debug[:30]} occ={last_rgbd_occlusion_debug[:18]} {last_debug_viewer_status[:22]} {last_render_throttle_debug[:18]} {load_shedding_debug_text()[:24]} {metrics_last_debug[:22]} {last_dock_stall_debug[:24]} {last_wall_trap_debug[:26]} {last_progress_gov_debug[:24]}"
+>>>>>>> brave-merkle-main
     )
 
 
@@ -1384,12 +1433,77 @@ def verbose_debug_status_line():
     )
 
 
+def exploration_explored_pct():
+    """Mapping (exploration) progress metric — the unknown-collapse number to judge
+    mapping by, independent of the driven-floor cleaning coverage.
+
+    explored = known / (known + interiorUnknown), where known = cleanable(known-free)
+    + obstacles(known-occupied) and interiorUnknown is the interior-clipped gray gap.
+    Coverage (driven floor) says nothing about how explored/bounded the map is, so this
+    is what the HUD and the debug log lead with.  Returns (pct, known, interiorUnknown).
+    """
+    known = int(last_coverage_total_cells or 0) + int(last_coverage_obstacle_cells or 0)
+    gray_int = int(last_gray_gap_cells or 0)
+    denom = known + gray_int
+    pct = (100.0 * known / denom) if denom > 0 else 0.0
+    return pct, known, gray_int
+
+
+def exploration_progress_hud_text():
+    """Honest two-mode mapping-progress label for the coverage-objective HUD.
+
+    A true '% of room explored' is NOT computable before the room loop-closes
+    without an arena prior (forbidden, CV-first): while the boundary is open the
+    big unmapped area beyond the frontier ring has no denominator, so explored =
+    known/(known+interiorUnknown) degenerates to ~100% (interiorUnknown is 0 until
+    pockets get enclosed).  So while open we report the monotone mapped AREA and the
+    open frontier instead of a fake percentage; once frontier_room_closed latches the
+    bounded-room resolved % becomes meaningful and we switch to it.
+    """
+    pct, known, unk = exploration_explored_pct()
+    if bool(frontier_room_closed):
+        return f"Explored: {pct:.1f}% (unk {unk})"
+    mapped_m2 = float(known) / float(max(1.0, float(MAP_SCALE) * float(MAP_SCALE)))
+    frontier = int(last_frontier_cells or 0)
+    return f"Mapping: open | mapped {mapped_m2:.1f}m2 | frontier {frontier}"
+
+
+def debug_log_file_line():
+    """Richest single-line telemetry for the per-run debug file.
+
+    Verbose line + raw frontier/gray/completion counts + wall-trap / progress state,
+    so the file has strictly more than either console line for post-run debugging.
+    """
+    try:
+        body_fill_cells = int(np.count_nonzero(obstacle_body_fill_cache)) if obstacle_body_fill_cache is not None else 0
+    except Exception:
+        body_fill_cells = -1
+    explored_pct, known, gray_int = exploration_explored_pct()
+    return (
+        verbose_debug_status_line()
+        + f", frontierCells={last_frontier_cells}, gray={last_gray_gap_debug}"
+        + f", completion={last_completion_gap_cells}/{last_completion_gap_components}"
+        + f", bodyFill={body_fill_cells}, wallTrap={last_wall_trap_debug}, prog={last_progress_gov_debug}"
+        + f", map=explored={explored_pct:.1f}% known={known} unkInt={gray_int} driven={last_coverage_cleaned_cells}/{last_coverage_total_cells}"
+        + f", stall={frontier_only_last_stall_debug}, rwSupp={right_wall_suppress_hits}/{right_wall_suppress_max_pen:.0f}"
+        + f", recPen={last_recent_target_penalty:.1f}"
+    )
+
+
 def print_debug_status_if_due():
-    global last_debug_time
-    if time.time() - last_debug_time <= DEBUG_PRINT_INTERVAL_SEC:
-        return
-    print(verbose_debug_status_line() if DEBUG_VERBOSE_CONSOLE else compact_debug_status_line())
-    last_debug_time = time.time()
+    global last_debug_time, last_debug_log_time
+    now = time.time()
+    # Console line (compact by default), throttled to DEBUG_PRINT_INTERVAL_SEC.
+    if now - last_debug_time > DEBUG_PRINT_INTERVAL_SEC:
+        print(verbose_debug_status_line() if DEBUG_VERBOSE_CONSOLE else compact_debug_status_line())
+        last_debug_time = now
+    # Per-run debug file: verbose+ line, logged more often, line-buffered to survive crashes.
+    if debug_log_file is not None and now - last_debug_log_time > DEBUG_LOG_INTERVAL_SEC:
+        try:
+            debug_log_file.write(debug_log_file_line() + "\n")
+        except Exception:
+            pass
+        last_debug_log_time = now
 
 
 def invalidate_heavy_map_caches(reason="invalidate"):
@@ -2015,6 +2129,12 @@ def start_grid_realign(target_heading, reason="grid realign", after_status="row 
     global desired_grid_heading, coverage_status, prev_cmd_left, prev_cmd_right, map_freeze_until
     global grid_realign_start_time, grid_realign_best_abs_error, grid_realign_last_progress_time, grid_realign_soft_finish, grid_realign_retry_count
     now = robot.getTime()
+    # If GRID_REALIGN is preempting an in-progress SCAN_AROUND, mark the scan as
+    # aborted before we change nav_state.  Otherwise the tile is never remembered
+    # and the same scan restarts in place once GRID_REALIGN returns to FORWARD
+    # (scan=start -> dwell -> GRID_REALIGN -> scan=start deadlock).  No-op when no
+    # scan is running, so normal grid realigns are unaffected.
+    note_active_scan_abort(reason)
     # GRID_REALIGN is part of the hard-grid controller.  Never let an
     # arbitrary escape/contact yaw such as -110 deg become the new row heading.
     # The target must be a room-cardinal heading: 0/90/180/-90.
@@ -4075,7 +4195,12 @@ def update_odometry():
     # During explicit pivot/settle we do not trust encoder translational drift.
     # If the robot really slides a few millimeters in Webots, that is less harmful
     # than drawing a large fake arc during a commanded in-place turn.
-    if globals().get("nav_state") in (NAV_TURN_90, NAV_SETTLE, NAV_LEG_ESCAPE_TURN):
+    # NAV_CONTACT_ROTATE is also a commanded in-place pivot (the contact-recovery
+    # tangent rotation).  When the robot is wedged against a low obstacle and that
+    # rotation slips, the wheels still register motion -> a fake translation gets
+    # integrated into the pose and the whole map shears ("odometry broke after it
+    # got stuck in the hole by the red box").  Intended dc here is ~0, so zero it.
+    if globals().get("nav_state") in (NAV_TURN_90, NAV_SETTLE, NAV_LEG_ESCAPE_TURN, NAV_CONTACT_ROTATE):
         dc = 0.0
 
     dt = max(timestep / 1000.0, 1e-3)
@@ -4775,6 +4900,9 @@ def _hypothesis_clear_on_free_observations():
         )
         clear = free & (~keep_confirmed) & (hypothesis_obstacle_log_odds > 0.0)
         if np.any(clear):
+            # Free-clear restored to *6.0 (the display flicker that motivated lowering
+            # this is now solved by the separate body-fill overlay; this layer only
+            # feeds the planner now, so keep it crisp/conservative).
             hypothesis_obstacle_log_odds[clear] = np.maximum(
                 0.0,
                 hypothesis_obstacle_log_odds[clear] + float(OBSTACLE_HYPOTHESIS_DECAY) * 6.0,
@@ -4785,7 +4913,17 @@ def _hypothesis_clear_on_free_observations():
                 0.0,
                 hypothesis_obstacle_log_odds[decay] + float(OBSTACLE_HYPOTHESIS_DECAY),
             )
-        return int(np.count_nonzero(clear | decay))
+        # Shadow-stamped cells in unknown/gray space (log_odds ≈ 0) get no free-observation
+        # signal, so they would otherwise be permanent.  Apply a slow global decay so that
+        # a false-positive stamp (e.g. large gray zone misclassified as furniture interior)
+        # clears itself out after ~200 s of simulation time without blocking the planner forever.
+        slow = (~clear) & (~decay) & (hypothesis_obstacle_log_odds > 0.0)
+        if np.any(slow):
+            hypothesis_obstacle_log_odds[slow] = np.maximum(
+                0.0,
+                hypothesis_obstacle_log_odds[slow] + float(OBSTACLE_HYPOTHESIS_DECAY) * float(OBSTACLE_HYPOTHESIS_UNKNOWN_DECAY_MULT),
+            )
+        return int(np.count_nonzero(clear | decay | slow))
     except Exception:
         return 0
 
@@ -4851,7 +4989,12 @@ def update_obstacle_hypothesis_cache(force=False):
         rej_free = 0
         max_span_px = max(6, int(round(float(OBSTACLE_HYPOTHESIS_MAX_SPAN_M) * MAP_SCALE)))
         free_strong = log_odds < float(OBSTACLE_HYPOTHESIS_FREE_CLEAR_LO)
-        observed_free = (log_odds < -LO_UNKNOWN_EPS) | (cleaned_mask > 0)
+        # Use a MODERATE free threshold here (not the barely-free unknown epsilon):
+        # a single grazing depth ray must NOT disqualify an obstacle interior from
+        # being shape-completed, or silhouettes go hollow once the robot circles them.
+        # Cleaned floor and confidently-free cells are still excluded, so the fill
+        # never paints over real observed floor.
+        observed_free = (log_odds < float(OBSTACLE_HYPOTHESIS_OBSERVED_FREE_LO)) | (cleaned_mask > 0)
         for cid in range(1, int(n)):
             area = int(stats[cid, cv2.CC_STAT_AREA])
             if area < int(OBSTACLE_HYPOTHESIS_MIN_COMPONENT_CELLS) or area > int(OBSTACLE_HYPOTHESIS_MAX_COMPONENT_CELLS):
@@ -4882,7 +5025,13 @@ def update_obstacle_hypothesis_cache(force=False):
             roi_confirmed = confirmed[y0:y1, x0:x1]
             roi_free = free_strong[y0:y1, x0:x1]
             roi_observed_free = observed_free[y0:y1, x0:x1]
-            roi_unknownish = (~roi_confirmed) & (~roi_free)
+            # Shape completion must fill only *genuinely unknown* interior.  Using the
+            # strong-free threshold (-2.25) alone let the fill paint over cells that
+            # were already observed free but only weakly (the "known points inside the
+            # orange blob"), and it over-extended the rectangular bbox into observed
+            # space.  Excluding observed_free keeps obstacle completion honest: a cell
+            # the sensors have seen as floor is never repainted as obstacle.
+            roi_unknownish = (~roi_confirmed) & (~roi_free) & (~roi_observed_free)
             fill = roi_unknownish.copy()
             # Keep a 1 px contact/edge contour visible; fill mostly the unknown
             # interior/shadow, not the already-black confirmed obstacle pixels.
@@ -4907,7 +5056,10 @@ def update_obstacle_hypothesis_cache(force=False):
                 hypothesis_obstacle_log_odds[additions] + float(OBSTACLE_HYPOTHESIS_SHAPE_UPDATE),
             )
         cache = hypothesis_obstacle_log_odds > float(OBSTACLE_HYPOTHESIS_OCC_EPS)
-        # Confirmed free always wins over hypothesis.
+        # Confirmed free always wins over hypothesis (restored).  The sticky-keep
+        # display hack is no longer needed: display flicker is handled by the separate
+        # body-fill overlay, and this inference layer must stay conservative because
+        # the planner subtracts it from the frontier.
         cache &= ~(log_odds < float(OBSTACLE_HYPOTHESIS_FREE_CLEAR_LO))
         hypothesis_obstacle_cache = cache.astype(np.bool_)
         hypothesis_obstacle_cache_step = int(step_id)
@@ -6713,6 +6865,44 @@ def completion_priority_active():
     except Exception:
         return False
 
+<<<<<<< HEAD
+=======
+def frontier_outside_room_mask(cleanable, obstacles, unknown):
+    """Return unknown 'background' cells that lie OUTSIDE the observed room envelope.
+
+    The room boundary is taken from sensor evidence ONLY (observed free floor +
+    obstacles), never from the known arena rectangle.  We close small gaps in that
+    boundary ring, then flood the non-boundary space inward from the map border:
+    everything the flood reaches is *outside the walls*.  Frontiers there are
+    unreachable ghosts (free floor touching the wall line generates "unknown next to
+    free" pointing OUT of the room), which is what makes the robot camp the wall and
+    never finish the map.  Enclosed interior unknown pockets are not reached by the
+    flood and stay valid frontiers.
+    """
+    try:
+        h, w = unknown.shape
+        barrier = (cleanable.astype(np.bool_) | obstacles.astype(np.bool_)).astype(np.uint8)
+        r = max(1, int(round(float(FRONTIER_INTERIOR_CLIP_CLOSE_M) * MAP_SCALE)))
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+        barrier = cv2.morphologyEx(barrier, cv2.MORPH_CLOSE, k, iterations=1)
+        floodable = (barrier == 0).astype(np.uint8)
+        # Pad with a floodable frame so the flood starts from a guaranteed-outside
+        # seed and reaches every border-connected non-boundary cell.
+        pad = cv2.copyMakeBorder(floodable, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=1)
+        ff_mask = np.zeros((pad.shape[0] + 2, pad.shape[1] + 2), np.uint8)
+        cv2.floodFill(pad, ff_mask, (0, 0), 2)
+        outside = pad[1:h + 1, 1:w + 1] == 2
+        unk = unknown.astype(np.bool_)
+        outside_unknown = outside & unk
+        # Enclosed interior unknown (gray pockets the border flood could not reach) is the
+        # loop-closure signal: it becomes large the moment the room boundary closes.
+        enclosed_unknown_cells = int(np.count_nonzero((~outside) & unk))
+        return outside_unknown, enclosed_unknown_cells
+    except Exception:
+        return np.zeros_like(unknown, dtype=np.bool_), 0
+
+
+>>>>>>> brave-merkle-main
 def build_frontier_revisit_mask(unknown, cleanable, obstacles):
     """Return frontier cells biased toward reachable interior gray gaps.
 
@@ -6727,6 +6917,27 @@ def build_frontier_revisit_mask(unknown, cleanable, obstacles):
         frontier_unknown = unknown & (~hyp_shadow)
         base_frontier = frontier_unknown & (cv2.dilate(cleanable.astype(np.uint8), np.ones((7, 7), np.uint8), iterations=1) > 0)
         base_frontier, frontier_noise_debug = filter_frontier_noise_mask(base_frontier, cleanable, obstacles, unknown)
+<<<<<<< HEAD
+=======
+        # Drop beyond-the-wall ghost frontiers once the room has CLOSED (loop closure),
+        # not at an arbitrary coverage percentage.  The same border flood that finds the
+        # outside also measures the enclosed interior; once that is sizable the room
+        # boundary has closed, which we latch and keep for the rest of the run.
+        global frontier_room_closed, last_frontier_room_closed_debug, last_room_enclosed_cells
+        interior_outside = None
+        if FRONTIER_INTERIOR_CLIP_ENABLED:
+            outside_bg, enclosed_cells = frontier_outside_room_mask(cleanable, obstacles, unknown)
+            last_room_enclosed_cells = int(enclosed_cells)
+            closure_min_cells = int(float(FRONTIER_ROOM_CLOSED_MIN_AREA_M2) * float(MAP_SCALE) * float(MAP_SCALE))
+            if (not frontier_room_closed) and enclosed_cells >= closure_min_cells:
+                frontier_room_closed = True
+            last_frontier_room_closed_debug = (
+                f"roomClosed={'yes' if frontier_room_closed else 'no'} encl={enclosed_cells}"
+            )
+            if frontier_room_closed and float(last_coverage_percent or 0.0) >= float(FRONTIER_INTERIOR_CLIP_MIN_COVERAGE):
+                interior_outside = outside_bg
+                base_frontier = base_frontier & (~interior_outside)
+>>>>>>> brave-merkle-main
         completion_mask = build_completion_gap_mask(frontier_unknown, cleanable, obstacles)
         last_gray_gap_cells = 0
         last_gray_gap_components = 0
@@ -6799,17 +7010,38 @@ def build_frontier_revisit_mask(unknown, cleanable, obstacles):
                 edge_total = max(1, int(np.count_nonzero(ring)))
                 clean_ratio = float(clean_edge) / float(edge_total)
                 obs_ratio = float(obs_edge) / float(edge_total)
-                shadow_like = bool(
-                    clean_ratio < float(GRAY_REVISIT_MIN_CLEANABLE_EDGE_RATIO)
-                    or obs_ratio > float(GRAY_REVISIT_MAX_OBSTACLE_EDGE_RATIO)
-                    or (obs_edge > clean_edge * float(GRAY_REVISIT_OBSTACLE_SHADOW_RATIO) and area < int(GRAY_REVISIT_MAX_COMPONENT_CELLS) * 0.75)
-                )
+                # Only a genuine furniture shadow (unseen object interior) should be
+                # walled off.  Such a patch is OBSTACLE-dominated on its boundary and
+                # bounded in size.  A region merely surrounded by *unknown* gray (low
+                # clean AND low obstacle edge) is an unexplored floor pocket -> keep it
+                # explorable as a frontier.  The legacy `clean_ratio < MIN` clause
+                # misclassified every not-yet-bordered interior pocket as a shadow,
+                # which fenced the robot into mapped corridors (right-wall camping),
+                # stopped the room from closing, and inflated the hypObs no-go layer.
+                shadow_area_ratio = float(GRAY_REVISIT_SHADOW_MAX_AREA_RATIO)
+                if shadow_area_ratio > 0.0:
+                    bounded_shadow = bool(area <= int(int(GRAY_REVISIT_MAX_COMPONENT_CELLS) * shadow_area_ratio))
+                    obstacle_dominated = bool(
+                        obs_ratio > float(GRAY_REVISIT_MAX_OBSTACLE_EDGE_RATIO)
+                        or obs_edge > clean_edge * float(GRAY_REVISIT_OBSTACLE_SHADOW_RATIO)
+                    )
+                    shadow_like = bool(bounded_shadow and obstacle_dominated)
+                else:
+                    # Legacy heuristic (kept for A/B comparison via config).
+                    shadow_like = bool(
+                        clean_ratio < float(GRAY_REVISIT_MIN_CLEANABLE_EDGE_RATIO)
+                        or obs_ratio > float(GRAY_REVISIT_MAX_OBSTACLE_EDGE_RATIO)
+                        or (obs_edge > clean_edge * float(GRAY_REVISIT_OBSTACLE_SHADOW_RATIO) and area < int(GRAY_REVISIT_MAX_COMPONENT_CELLS) * 0.75)
+                    )
                 if shadow_like:
                     # This gray component is likely the unseen interior/occlusion
                     # side of an obstacle.  Do not make it a frontier target; mark
                     # it as an orange hypothesis so it is visible and suppressed.
                     try:
-                        if OBSTACLE_HYPOTHESIS_ENABLED and area >= int(OBSTACLE_HYPOTHESIS_MIN_FILL_CELLS):
+                        if (
+                            OBSTACLE_HYPOTHESIS_ENABLED
+                            and int(OBSTACLE_HYPOTHESIS_MIN_FILL_CELLS) <= area <= int(OBSTACLE_HYPOTHESIS_MAX_COMPONENT_CELLS)
+                        ):
                             hypothesis_obstacle_log_odds[comp] = np.minimum(
                                 float(OBSTACLE_HYPOTHESIS_MAX),
                                 hypothesis_obstacle_log_odds[comp] + float(OBSTACLE_HYPOTHESIS_SHADOW_UPDATE),
@@ -6831,13 +7063,44 @@ def build_frontier_revisit_mask(unknown, cleanable, obstacles):
         comp_frontier = completion_mask & around_cleanable
         frontier = base_frontier | gap_frontier | comp_frontier
         frontier, frontier_noise_debug = filter_frontier_noise_mask(frontier, cleanable, obstacles, unknown)
+<<<<<<< HEAD
         cells = int(cells) + int(last_completion_gap_cells or 0)
         comps = int(comps) + int(last_completion_gap_components or 0)
+=======
+        if interior_outside is not None:
+            frontier = frontier & (~interior_outside)
+            # Interior-clip the completion SIGNAL too, not just the routed frontier.
+            # last_gray_gap_cells / last_completion_gap_cells feed AUTO_MAP_COMPLETE
+            # and the stall->dock give-up.  If beyond-the-wall (outside-room) unknown
+            # is counted here, the room reads "never finished" forever: the robot
+            # camps a wall chasing unreachable outside gray (grayGap~32k blocks both
+            # the completion gate <=220 and the dock give-up >=650) and never docks.
+            # Recount gray + completion on the enclosed interior only.
+            gap_unknown = gap_unknown & (~interior_outside)
+            n_gap, _lab_gap, st_gap, _c_gap = cv2.connectedComponentsWithStats(gap_unknown.astype(np.uint8), 8)
+            cells = sum(int(st_gap[i, cv2.CC_STAT_AREA]) for i in range(1, int(n_gap)))
+            comps = max(0, int(n_gap) - 1)
+            comp_inside = completion_mask & (~interior_outside)
+            n_comp, _lab_comp, _st_comp, _c_comp = cv2.connectedComponentsWithStats(comp_inside.astype(np.uint8), 8)
+            comp_in_cells = int(np.count_nonzero(comp_inside))
+            comp_in_comps = max(0, int(n_comp) - 1)
+            last_completion_gap_cells = comp_in_cells
+            last_completion_gap_components = comp_in_comps
+            cells = int(cells) + comp_in_cells
+            comps = int(comps) + comp_in_comps
+        else:
+            cells = int(cells) + int(last_completion_gap_cells or 0)
+            comps = int(comps) + int(last_completion_gap_components or 0)
+>>>>>>> brave-merkle-main
         last_gray_gap_cells = int(cells)
         last_gray_gap_components = int(comps)
         last_gray_gap_debug = (
             f"grayGap={int(cells)}/{int(comps)} rejE/S/O={rejected_edge}/{rejected_size}/{rejected_shadow} "
+<<<<<<< HEAD
             f"{last_completion_gap_debug} {frontier_noise_debug}"
+=======
+            f"{last_completion_gap_debug} {frontier_noise_debug} {last_frontier_room_closed_debug}"
+>>>>>>> brave-merkle-main
         )
         return frontier.astype(np.bool_)
     except Exception as exc:
@@ -7978,6 +8241,92 @@ def remember_active_scan_area(reason):
         active_scan_area_memory = active_scan_area_memory[-ACTIVE_SCAN_AREA_MEMORY_MAX:]
 
 
+def active_scan_tile_abort_suppressed(now, tile_key=None):
+    """Hard suppression of a tile that just aborted a scan.
+
+    Unlike the normal area cooldown, completion-priority does NOT bypass this.
+    It exists specifically to break the scan=start -> GRID_REALIGN -> scan=start
+    deadlock, where completion force would otherwise immediately re-trigger the
+    same scan in the same tile.  The window is short (ACTIVE_SCAN_ABORT_SUPPRESS_
+    SEC), so the area can be revisited later if it is still genuinely useful.
+    """
+    global active_scan_abort_memory
+    if not ACTIVE_SCAN_ABORT_LOOP_GUARD_ENABLED:
+        return False
+    if tile_key is None:
+        tile_key = active_scan_tile_key()
+    keep = []
+    suppressed = False
+    for item in active_scan_abort_memory:
+        try:
+            if float(item.get("until", -999.0)) > float(now):
+                keep.append(item)
+                if tuple(item.get("tile", (None, None))) == tuple(tile_key):
+                    suppressed = True
+        except Exception:
+            continue
+    active_scan_abort_memory = keep
+    return suppressed
+
+
+def note_active_scan_abort(reason):
+    """Record that an in-progress SCAN_AROUND was preempted (GRID_REALIGN/recovery).
+
+    Breaks the in-place scan/replan deadlock: hard-suppress the started tile for a
+    short window, count repeats, and after enough aborts in the same tile blacklist
+    the current target so the planner picks a different frontier/completion goal.
+    Does nothing unless a scan is actually mid-sequence, so it never interferes
+    with normal navigation, dock return, or route commit.
+    """
+    global active_scan_abort_memory, active_scan_target_yaws, active_scan_index
+    global active_scan_dwell_until, last_active_scan_debug, last_planner_update_step
+    if not ACTIVE_SCAN_ABORT_LOOP_GUARD_ENABLED:
+        return
+    # Only a scan that is genuinely running (turning/dwelling, not yet complete)
+    # counts as an abort.
+    if nav_state != NAV_SCAN_AROUND or not active_scan_target_yaws:
+        return
+    if active_scan_index >= len(active_scan_target_yaws):
+        return
+    try:
+        now = float(robot.getTime())
+    except Exception:
+        now = 0.0
+    tile = active_scan_tile_key(active_scan_started_x, active_scan_started_y)
+    entry = None
+    for item in active_scan_abort_memory:
+        if tuple(item.get("tile", (None, None))) == tuple(tile):
+            entry = item
+            break
+    if entry is None:
+        entry = {"tile": tile, "count": 0, "until": now}
+        active_scan_abort_memory.append(entry)
+    entry["count"] = int(entry.get("count", 0)) + 1
+    entry["until"] = now + float(ACTIVE_SCAN_ABORT_SUPPRESS_SEC)
+    if len(active_scan_abort_memory) > ACTIVE_SCAN_AREA_MEMORY_MAX:
+        active_scan_abort_memory = active_scan_abort_memory[-ACTIVE_SCAN_AREA_MEMORY_MAX:]
+    # After repeated aborts in the same tile, penalize the current target so the
+    # planner replans to a different frontier/completion goal.
+    if int(entry["count"]) >= int(ACTIVE_SCAN_ABORT_BLACKLIST_AFTER):
+        try:
+            if coverage_goal_map is not None:
+                register_map_target_blacklist(
+                    int(coverage_goal_map[0]), int(coverage_goal_map[1]),
+                    str(coverage_goal_kind or "frontier"),
+                    "scan-loop aborted tile",
+                    ttl_sec=float(ACTIVE_SCAN_ABORT_BLACKLIST_SEC),
+                    radius_m=float(ACTIVE_SCAN_ABORT_BLACKLIST_RADIUS_M),
+                )
+        except Exception:
+            pass
+    # Drop the abandoned scan so nothing lingers, and force a replan.
+    active_scan_target_yaws = []
+    active_scan_index = 0
+    active_scan_dwell_until = -999.0
+    last_planner_update_step = -999999
+    last_active_scan_debug = f"scan=aborted {str(reason)[:24]} tile={tile} n={int(entry['count'])}"
+
+
 def post_turn_rgbd_snapshot_phase(now=None):
     """Return idle/settle/capture for the bounded post-turn RGB-D snapshot."""
     if now is None:
@@ -8162,6 +8511,15 @@ def active_rgbd_scan_need(front, body_clearance):
         except Exception:
             pass
     tile_key = active_scan_tile_key()
+<<<<<<< HEAD
+=======
+    # Hard abort-suppression: a tile that just lost a scan to GRID_REALIGN/recovery
+    # must not be re-scanned immediately, even under completion priority — that is
+    # exactly the deadlock case.  Checked before the completion bypass below.
+    if active_scan_tile_abort_suppressed(now, tile_key):
+        last_active_scan_debug = f"scan=abort-cooldown tile={tile_key}"
+        return False, "scan abort cooldown"
+>>>>>>> brave-merkle-main
     completion_scan_force = completion_priority_active()
     if active_scan_area_suppressed(now, tile_key) and not completion_scan_force:
         return False, "area cooldown"
@@ -8504,6 +8862,17 @@ def exploration_frontier_only_owner_gate(front, center, body_clearance, left=Non
         last_frontier_only_gate_debug = f"frontierGate=holdRelease {hold_stall_sec:.0f}s->row"
         return False
 
+<<<<<<< HEAD
+=======
+    if EXPLORATION_FRONTIER_ONLY_HOLD_DRIVE_INSTEAD:
+        # Do not freeze on a non-committable frontier: drive locally instead so the
+        # robot keeps moving and mapping, leaving the dead spot.  The progress
+        # governor + target blacklist still redirect it; snapshots above still run.
+        coverage_status = f"frontier-only -> row drive: {str(route_reason)[:42]} fr={frontiers} cov={cov:.1f}"
+        last_optional_block_reason = "frontier-only noncommit -> ROW_FORWARD drive"
+        last_frontier_only_gate_debug = f"frontierGate=holdDrive {str(route_reason)[:24]}"
+        return False
+>>>>>>> brave-merkle-main
     coverage_status = f"frontier-only hold: {str(route_reason)[:52]} fr={frontiers} cov={cov:.1f}"
     last_optional_block_reason = "frontier-only blocks ROW_FORWARD"
     last_frontier_only_gate_debug = f"frontierGate=hold route={int(route_present)} {str(route_reason)[:28]} {frontier_only_last_stall_debug}"
@@ -8547,9 +8916,49 @@ def finish_active_rgbd_scan(reason="done"):
     global nav_state, active_scan_target_yaws, active_scan_index, active_scan_dwell_until
     global active_scan_last_completed_at, active_scan_last_x, active_scan_last_y
     global last_active_scan_debug, coverage_status, last_planner_update_step
+    global active_scan_abort_memory
     active_scan_last_completed_at = robot.getTime()
     active_scan_last_x = pose_x
     active_scan_last_y = pose_y
+    # No-gain detector: a scan that revealed essentially no new local unknown area
+    # must not be re-forced in place.  Hard-suppress the tile via the abort memory
+    # (the gate checks that BEFORE the completion-priority bypass), so the
+    # scan<->hard-corner-GRID_REALIGN loop (cov frozen, add=0) is broken; after
+    # repeats, blacklist the frontier target so the planner moves elsewhere.
+    if ACTIVE_SCAN_NOGAIN_SUPPRESS_ENABLED:
+        try:
+            _o, _cl, _c, _u, unknown_g = compute_coverage_masks()
+            smx, smy = world_to_map(active_scan_started_x, active_scan_started_y)
+            end_unknown_local = local_mask_count(unknown_g, smx, smy, ACTIVE_SCAN_TRIGGER_RADIUS_M)
+            unknown_drop = int(active_scan_start_unknown_local or 0) - int(end_unknown_local)
+            if unknown_drop < int(ACTIVE_SCAN_NOGAIN_MIN_UNKNOWN_DROP):
+                tile = active_scan_tile_key(active_scan_started_x, active_scan_started_y)
+                now2 = robot.getTime()
+                entry = None
+                for item in active_scan_abort_memory:
+                    if tuple(item.get("tile", (None, None))) == tuple(tile):
+                        entry = item
+                        break
+                if entry is None:
+                    entry = {"tile": tile, "count": 0, "until": now2}
+                    active_scan_abort_memory.append(entry)
+                entry["count"] = int(entry.get("count", 0)) + 1
+                entry["until"] = now2 + float(ACTIVE_SCAN_ABORT_SUPPRESS_SEC)
+                if len(active_scan_abort_memory) > ACTIVE_SCAN_AREA_MEMORY_MAX:
+                    active_scan_abort_memory = active_scan_abort_memory[-ACTIVE_SCAN_AREA_MEMORY_MAX:]
+                if int(entry["count"]) >= int(ACTIVE_SCAN_ABORT_BLACKLIST_AFTER) and coverage_goal_map is not None:
+                    try:
+                        register_map_target_blacklist(
+                            int(coverage_goal_map[0]), int(coverage_goal_map[1]),
+                            str(coverage_goal_kind or "frontier"), "scan no-gain loop",
+                            ttl_sec=float(ACTIVE_SCAN_ABORT_BLACKLIST_SEC),
+                            radius_m=float(ACTIVE_SCAN_ABORT_BLACKLIST_RADIUS_M),
+                        )
+                    except Exception:
+                        pass
+                reason = f"{reason} nogain drop={unknown_drop} n={int(entry['count'])}"
+        except Exception:
+            pass
     active_scan_target_yaws = []
     active_scan_index = 0
     active_scan_dwell_until = -999.0
@@ -9117,7 +9526,10 @@ def plan_best_coverage_route(obstacles, cleanable, cleaned, uncleaned, unknown, 
     global last_coverage_footprint_debug, last_coverage_footprint_gain_cells, last_coverage_footprint_reclean_ratio
     global last_coverage_segment_debug
     global last_explore_arbitration_debug, last_exploration_route_debug, last_frontier_target_debug, last_known_backtrack_debug, last_explore_gain_debug, last_commit_type_debug, planner_mode
+    global right_wall_suppress_hits, right_wall_suppress_max_pen
     planner_t0 = time.perf_counter()
+    right_wall_suppress_hits = 0
+    right_wall_suppress_max_pen = 0.0
     route_target_blacklist_prune()
     last_route_dock_loiter_guard_debug = "clear"
     last_missed_strip_recovery_debug = "none"
@@ -9268,6 +9680,10 @@ def plan_best_coverage_route(obstacles, cleanable, cleaned, uncleaned, unknown, 
     coarse_frontier_component_cells = np.zeros((gh, gw), dtype=np.int32)
     coarse_frontier_unknown_cells = np.zeros((gh, gw), dtype=np.int32)
     coarse_completion_cells = np.zeros((gh, gw), dtype=np.int32)
+<<<<<<< HEAD
+=======
+    coarse_obs_boundary_cells = np.zeros((gh, gw), dtype=np.int32)
+>>>>>>> brave-merkle-main
 
     for gy in range(gh):
         py0 = y0 + gy * step
@@ -9327,6 +9743,10 @@ def plan_best_coverage_route(obstacles, cleanable, cleaned, uncleaned, unknown, 
             coarse_frontier_component_cells[gy, gx] = int(frontier_component_cells)
             coarse_frontier_unknown_cells[gy, gx] = int(unknown_local_cells)
             coarse_completion_cells[gy, gx] = int(completion_local)
+<<<<<<< HEAD
+=======
+            coarse_obs_boundary_cells[gy, gx] = int(obs_boundary_local)
+>>>>>>> brave-merkle-main
             fp_gain_cells = int(footprint_gain_count[cy, cx]) if map_inside(cx, cy) else 0
             fp_gain_ratio = float(footprint_gain_ratio[cy, cx]) if map_inside(cx, cy) else 0.0
             fp_reclean_ratio = float(footprint_reclean_ratio[cy, cx]) if map_inside(cx, cy) else 1.0
@@ -9669,7 +10089,12 @@ def plan_best_coverage_route(obstacles, cleanable, cleaned, uncleaned, unknown, 
         turn_need = abs(normalize_angle(angle_to_target - pose_theta)) / math.pi
         reward = float(target_reward[gy, gx])
         kind_code = int(target_kind[gy, gx])
-        if exploration_route_only and kind_code != 2:
+        # Frontier exploration normally keeps only kind=2 (frontier).  Round 6s also lets
+        # kind=4 (obstacle-inspection vantage) through so the robot will divert to map/fill
+        # furniture instead of only chasing open frontiers.  Flag-gated for clean revert.
+        if exploration_route_only and kind_code != 2 and not (
+            kind_code == 4 and OBS_BOUNDARY_FRONTIER_EXPLORATION_TARGET
+        ):
             continue
         if kind_code == 3 and straight_dist > GLOBAL_ROUTE_UNDER_MAX_DIST_M:
             continue
@@ -9746,7 +10171,7 @@ def plan_best_coverage_route(obstacles, cleanable, cleaned, uncleaned, unknown, 
             if comp_id > 0:
                 rejected_component_reason.setdefault(comp_id, "edge_residual")
             continue
-        kind_name_loop = {1: "uncleaned", 2: "frontier", 3: "under-surface"}.get(kind_code, "uncleaned")
+        kind_name_loop = {1: "uncleaned", 2: "frontier", 3: "under-surface", 4: "obs-vantage"}.get(kind_code, "uncleaned")
         if kind_code == 2 and route_target_is_blacklisted(cx, cy, "frontier"):
             last_residual_route_deferred_cells += 1
             if FRONTIER_COMPONENT_TARGETING_ENABLED:
@@ -9819,7 +10244,30 @@ def plan_best_coverage_route(obstacles, cleanable, cleaned, uncleaned, unknown, 
         # frontier/vantage minus route cost and motion complexity. Coverage
         # route-shape penalties: a huge side frontier must not beat a simple
         # forward frontier just because its component has more unknown cells.
-        if exploration_route_only and kind_code == 2:
+        if exploration_route_only and kind_code == 4:
+            # Obstacle-inspection vantage: a free-floor standpoint beside an obstacle with
+            # unseen faces.  Scored on the SAME penalty scale as frontier targets so it can
+            # fairly win, with a proximity bonus that decays to 0 at NEAR_RADIUS so the
+            # robot diverts to a *nearby* obstacle but never crosses the room for a far one.
+            obs_local = int(coarse_obs_boundary_cells[gy, gx])
+            obs_close_bonus = float(OBS_BOUNDARY_FRONTIER_CLOSE_BONUS) * max(
+                0.0, 1.0 - straight_dist / max(1e-6, float(OBS_BOUNDARY_FRONTIER_NEAR_RADIUS_M))
+            )
+            score = (
+                reward
+                + obs_close_bonus
+                - EXPLORATION_ROUTE_COST_PENALTY * route_cost_m
+                - EXPLORATION_ROUTE_TURN_PENALTY * turn_need
+                - EXPLORATION_ROUTE_LATERAL_PENALTY * lateral
+                - footprint_penalty
+                - EXPLORATION_FRONTIER_RECENT_VISIT_PENALTY_SCALE * recent_penalty
+                + EXPLORATION_ROUTE_FORWARD_BONUS * max(0.0, forward)
+            )
+            last_exploration_route_debug = (
+                f"exploreRoute=obs-vantage obs={obs_local} reward={reward:.1f} "
+                f"close={obs_close_bonus:.1f} cost={route_cost_m:.2f} d={straight_dist:.2f}"
+            )
+        elif exploration_route_only and kind_code == 2:
             if EXPLORATION_ROUTE_GEOMETRY_STABILITY_ENABLED:
                 route_for_candidate, route_geo = reconstruct_route_and_geometry(parent, (sx, sy), (gx, gy), x0, y0, step)
                 route_first_turn_frac = float(route_geo.get("first_turn_frac", 0.0))
@@ -9853,6 +10301,12 @@ def plan_best_coverage_route(obstacles, cleanable, cleaned, uncleaned, unknown, 
                     wall_repeat_penalty = float(RIGHT_WALL_REPEAT_SUPPRESS_PENALTY)
                     if completion_priority_active():
                         wall_repeat_penalty = float(RIGHT_WALL_REPEAT_SUPPRESS_WITH_COMPLETION_PENALTY)
+<<<<<<< HEAD
+=======
+                    right_wall_suppress_hits += 1
+                    if wall_repeat_penalty > right_wall_suppress_max_pen:
+                        right_wall_suppress_max_pen = wall_repeat_penalty
+>>>>>>> brave-merkle-main
             except Exception:
                 wall_repeat_penalty = 0.0
             if LOCAL_FIRST_FRONTIER_ENABLED:
@@ -9895,7 +10349,7 @@ def plan_best_coverage_route(obstacles, cleanable, cleaned, uncleaned, unknown, 
                 - EXPLORATION_ROUTE_CORNER_PENALTY * float(route_corner_count)
                 - EXPLORATION_ROUTE_EXTRA_CORNER_PENALTY * float(extra_corners)
                 - footprint_penalty
-                - 0.25 * recent_penalty
+                - EXPLORATION_FRONTIER_RECENT_VISIT_PENALTY_SCALE * recent_penalty
                 + EXPLORATION_ROUTE_FORWARD_BONUS * max(0.0, forward)
             )
             last_exploration_route_debug = (
@@ -10033,8 +10487,14 @@ def plan_best_coverage_route(obstacles, cleanable, cleaned, uncleaned, unknown, 
             f"d={float(straight_dist):.2f} cost={float(route_cost_m):.2f} gray={selected_gray} "
             f"route=ok fail={last_route_target_blacklist_debug[:18]} reason={selected_reason}"
         )
+    elif int(kind_code) == 4:
+        last_frontier_target_debug = (
+            f"frontierChoice selected=({int(cx)},{int(cy)}) score={float(score):.1f} "
+            f"d={float(straight_dist):.2f} cost={float(route_cost_m):.2f} kind=obs-vantage "
+            f"route=ok reason=obstacle-inspect"
+        )
     last_explore_gain_debug = f"exploreGain={int(local_mask_count(frontier, int(cx), int(cy), EXPLORE_FRONTIER_LOCAL_RADIUS_M)) if kind_code == 2 else 0} coverageGain={int(fp_gain_cells) if kind_code == 1 else int(coverage_segment_gain)}"
-    last_commit_type_debug = "commitType=" + {1: "uncleaned", 2: "frontier", 3: "under-surface"}.get(int(kind_code), "unknown")
+    last_commit_type_debug = "commitType=" + {1: "uncleaned", 2: "frontier", 3: "under-surface", 4: "obs-boundary"}.get(int(kind_code), "unknown")
     last_coverage_footprint_gain_cells = int(fp_gain_cells)
     last_coverage_footprint_reclean_ratio = float(fp_reclean_ratio)
     last_coverage_footprint_debug = f"fpGain={int(fp_gain_cells)} fpRatio={float(fp_gain_ratio):.2f} fpReclean={float(fp_reclean_ratio):.2f}"
@@ -10054,7 +10514,18 @@ def plan_best_coverage_route(obstacles, cleanable, cleaned, uncleaned, unknown, 
         wx = (cx - MAP_ORIGIN_X) / MAP_SCALE
         wy = (MAP_ORIGIN_Y - cy) / MAP_SCALE
     wp_map, wp_world = route_waypoint_from_path(route)
+<<<<<<< HEAD
     kind_name = {1: "uncleaned", 2: "frontier", 3: "under-surface", 4: "obs-boundary"}.get(kind_code, "uncleaned")
+=======
+    if kind_code == 4 and exploration_route_only and OBS_BOUNDARY_FRONTIER_EXPLORATION_TARGET:
+        # The obstacle-inspection vantage was SELECTED with the kind=4 obstacle reward,
+        # but it is COMMITTED as a frontier so the existing frontier route+RGBD-capture
+        # pipeline drives the robot to the standpoint (all the exploration commit gates
+        # key off kind=="frontier").  Downstream simply routes there like any frontier.
+        kind_name = "frontier"
+    else:
+        kind_name = {1: "uncleaned", 2: "frontier", 3: "under-surface", 4: "obs-boundary"}.get(kind_code, "uncleaned")
+>>>>>>> brave-merkle-main
     route_world = [((mx - MAP_ORIGIN_X) / MAP_SCALE, (MAP_ORIGIN_Y - my) / MAP_SCALE) for mx, my in route]
     last_route_planner_ms = (time.perf_counter() - planner_t0) * 1000.0
     last_route_planner_nodes = int(expanded_nodes)
@@ -10111,7 +10582,7 @@ def update_coverage_objective():
     global coverage_route_commit_class, coverage_route_straight_dist, coverage_route_lateral_abs, coverage_route_turn_need, coverage_route_continuity_bonus, coverage_route_top_debug
     global coverage_route_wall_strip_bonus, coverage_route_missed_strip_bonus, coverage_route_segment_gain, coverage_route_segment_bonus, coverage_route_footprint_gain_cells
     global coverage_route_first_turn_frac, coverage_route_corner_count, coverage_route_geometry_debug
-    global last_coverage_total_cells, last_coverage_cleaned_cells, last_coverage_percent
+    global last_coverage_total_cells, last_coverage_cleaned_cells, last_coverage_percent, last_coverage_obstacle_cells
     global last_frontier_cells, last_gray_gap_cells, last_gray_gap_components, last_gray_gap_debug, last_uncleaned_cells, last_under_surface_target_cells
     global last_residual_route_deferred_cells, last_route_planner_ms, last_route_planner_nodes
 
@@ -10125,6 +10596,7 @@ def update_coverage_objective():
     done = int(np.count_nonzero(cleaned & cleanable))
     last_coverage_total_cells = total
     last_coverage_cleaned_cells = done
+    last_coverage_obstacle_cells = int(np.count_nonzero(obstacles))
     last_coverage_percent = (100.0 * done / total) if total > 0 else 0.0
     last_uncleaned_cells = int(np.count_nonzero(uncleaned))
 
@@ -10304,6 +10776,10 @@ def update_coverage_objective():
                 continue
             if kind == "uncleaned" and route_target_is_blacklisted(mx, my, "uncleaned"):
                 continue
+            if kind == "frontier" and FRONTIER_REACHABILITY_FILTER_ENABLED and route_target_is_blacklisted(mx, my, "frontier"):
+                # An unreachable frontier blacklisted by the reachability filter
+                # below: skip it so the planner picks a different reachable one.
+                continue
             if kind == "uncleaned" and route_target_is_edge_residual_trap(mx, my, local_mask_count(uncleaned & cleanable, mx, my, RESIDUAL_TARGET_LOCAL_RADIUS_M)):
                 last_residual_route_deferred_cells += 1
                 continue
@@ -10405,6 +10881,28 @@ def update_coverage_objective():
         )
     else:
         coverage_route_status = f"fallback {kind} no-direct d={coverage_route_straight_dist:.2f} blocked={direct_blocked:.2f}"
+        if FRONTIER_REACHABILITY_FILTER_ENABLED and kind == "frontier":
+            # We are in the fallback (wavefront found no route) AND the straight
+            # line to this frontier is blocked -> it is unreachable right now.
+            # Do NOT commit it: that is exactly how the robot fixated and looped
+            # scan/grid-realign with cov frozen.  Blacklist it briefly and clear
+            # the goal so the next cycle selects a different reachable frontier;
+            # the robot keeps mapping locally via hybrid-row meanwhile.
+            try:
+                register_map_target_blacklist(
+                    int(mx), int(my), "frontier",
+                    "unreachable frontier (fallback no-direct)",
+                    ttl_sec=float(FRONTIER_UNREACHABLE_BLACKLIST_SEC),
+                    radius_m=float(FRONTIER_UNREACHABLE_BLACKLIST_RADIUS_M),
+                )
+            except Exception:
+                pass
+            coverage_goal_map = None
+            coverage_goal_world = None
+            coverage_goal_kind = "none"
+            coverage_route_status = f"fallback frontier unreachable -> blacklist+replan ({int(mx)},{int(my)})"
+            perf_end("planner", t_perf_planner)
+            return None
     perf_end("planner", t_perf_planner)
     return coverage_goal_world
 
@@ -10451,8 +10949,11 @@ def update_map_maturity():
     coverage_ready = bool(enough_area and last_coverage_percent >= MAP_MATURE_COVERAGE_PERCENT)
     time_ready = bool(enough_area and t >= MAP_MATURE_MIN_TIME_SEC and last_coverage_percent >= MAP_MATURE_TIME_COVERAGE_PERCENT)
     frontier_low = bool(enough_area and frontier_ratio <= MAP_MATURE_MAX_FRONTIER_RATIO and last_coverage_percent >= MAP_MATURE_TIME_COVERAGE_PERCENT)
+    # The timeout path must not call the map mature while a large interior gray gap
+    # is still open (the room is not closed yet); the high-coverage path is exempt.
+    gray_low = bool(int(last_gray_gap_cells or 0) <= int(MAP_MATURE_MAX_GRAY_GAP_CELLS))
     no_longer_map_building = not map_building_active()
-    mature = bool(PLANNED_COVERAGE_ENABLED and no_longer_map_building and (coverage_ready or (time_ready and frontier_low)))
+    mature = bool(PLANNED_COVERAGE_ENABLED and no_longer_map_building and (coverage_ready or (time_ready and frontier_low and gray_low)))
 
     partial_coverage = bool(
         HYBRID_COVERAGE_ENABLED
@@ -11195,6 +11696,17 @@ def complete_map_return_to_dock(reason="map locked at dock"):
             acquire_control(ControlOwner.PLANNER, DOCK_STOP_HOLD_OWNER_SEC, 0.0, "map-only docked stop")
         except Exception:
             pass
+<<<<<<< HEAD
+=======
+        # Mission deliverable: emit the finished map automatically on docking so the
+        # run ends with a saved occupancy/coverage map (no manual 'S' keypress).
+        if AUTO_SAVE_MAP_ON_DOCK:
+            try:
+                save_map()
+                print("[MISSION] map auto-saved on dock")
+            except Exception as exc:
+                print("[MISSION] auto map save failed:", type(exc).__name__, exc)
+>>>>>>> brave-merkle-main
         print("[MISSION] map-only complete:", dock_return_status)
         return True
     dock_return_completed = False
@@ -13001,6 +13513,12 @@ def active_scan_mapping_dwell_ready(now=None):
         return False
     if active_scan_dwell_until <= now:
         return False
+    # (2) Settle first: exclude the dwell ENTRY, where the robot is still coasting from
+    # the turn.  dwell_until is set to entry + ACTIVE_SCAN_DWELL_SEC, so elapsed-in-dwell
+    # = now - (dwell_until - DWELL_SEC); require it to exceed the settle delay.
+    elapsed_in_dwell = now - (active_scan_dwell_until - float(ACTIVE_SCAN_DWELL_SEC))
+    if elapsed_in_dwell < float(ACTIVE_SCAN_DWELL_SETTLE_SEC):
+        return False
     if active_scan_dwell_until - now < ACTIVE_SCAN_DWELL_MAP_MIN_REMAIN_SEC:
         return False
     return True
@@ -13017,14 +13535,20 @@ def route_or_scan_rotation_mapping_reason(now=None):
     """
     if now is None:
         now = robot.getTime()
-    if nav_state == NAV_SCAN_AROUND and not active_scan_mapping_dwell_ready(now):
-        return "scan-turn"
-    if nav_state in MAPPING_FREEZE_STATES:
-        return f"nav={nav_state}"
     cmd_omega = ((prev_cmd_right * RIGHT_SIGN) - (prev_cmd_left * LEFT_SIGN)) * WHEEL_RADIUS / max(WHEEL_BASE, 1e-6)
     req_omega = ((last_requested_right * RIGHT_SIGN) - (last_requested_left * LEFT_SIGN)) * WHEEL_RADIUS / max(WHEEL_BASE, 1e-6)
     omega = current_angular_velocity
     max_omega = max(abs(cmd_omega), abs(req_omega), abs(omega))
+    if nav_state == NAV_SCAN_AROUND:
+        if not active_scan_mapping_dwell_ready(now):
+            return "scan-turn"
+        # (1) Even inside the settled dwell, only fuse when residual rotation is truly
+        # tiny — a stricter limit than the global one used for forward arcs.
+        if max_omega > float(ACTIVE_SCAN_DWELL_OMEGA_LIMIT):
+            return "scan-settle"
+        return ""
+    if nav_state in MAPPING_FREEZE_STATES:
+        return f"nav={nav_state}"
     if max_omega > TURN_MAPPING_OMEGA_LIMIT:
         # Forward-arc exception: a heading-lock correction is a differential arc,
         # not a pivot.  When the robot is actually translating forward on a wide
@@ -13034,9 +13558,19 @@ def route_or_scan_rotation_mapping_reason(now=None):
         if (
             FORWARD_ARC_MAPPING_ENABLED
             and nav_state == NAV_FORWARD
+<<<<<<< HEAD
             and last_motion_primitive not in (
                 MotionPrimitive.TURN_IN_PLACE.value,
                 MotionPrimitive.FINE_ALIGN.value,
+=======
+            # FINE_ALIGN is the forward heading-correction primitive: it legitimately
+            # translates while nudging yaw, so it must NOT be excluded here (that was
+            # the main "scanner off while driving" gap).  True in-place pivots
+            # (TURN_IN_PLACE) and recovery turns stay excluded; even so the v+R
+            # kinematic test below gates out any near-stationary rotation (v~0).
+            and last_motion_primitive not in (
+                MotionPrimitive.TURN_IN_PLACE.value,
+>>>>>>> brave-merkle-main
                 MotionPrimitive.CONTACT_RELEASE_TURN.value,
             )
             and abs(current_linear_velocity) >= float(FORWARD_ARC_MAPPING_MIN_LINEAR_MPS)
@@ -17039,6 +17573,108 @@ def mature_dock_return_stall_watchdog(left, right, body_clearance):
     return True
 
 
+<<<<<<< HEAD
+=======
+def global_progress_governor():
+    """Regime-independent anti-freeze: progress is the only currency.
+
+    Every stuck mode we have seen (scan<->grid-realign loop, frontier-only hold
+    with owner=NONE, fixation on an unreachable frontier, wall pin) shares ONE
+    signature: the robot pose AND coverage are both frozen while a goal is held.
+    Detect that once and abandon the goal -- blacklist its neighbourhood and force
+    a replan -- regardless of nav_state, coverage regime, or which narrow watchdog
+    would apply.  This is the governor's core guarantee: make progress or drop the
+    goal; never stay frozen.  Advisory: it does not seize wheels, it just removes
+    the stuck goal so the planner reselects (and after repeated freezes, docks).
+    """
+    global progress_gov_anchor_x, progress_gov_anchor_y, progress_gov_anchor_cov
+    global progress_gov_since, progress_gov_escalations, progress_gov_relocations, last_progress_gov_debug
+    global last_planner_update_step
+    if not GLOBAL_PROGRESS_GOVERNOR_ENABLED:
+        return
+    if map_mature or dock_return_active or dock_return_completed or known_map_coverage_eval_active():
+        progress_gov_since = -999.0
+        progress_gov_escalations = 0
+        return
+    if planner_intent != PLANNER_INTENT_EXPAND_MAP:
+        progress_gov_since = -999.0
+        return
+    try:
+        now = float(robot.getTime())
+        cov = float(last_coverage_percent or 0.0)
+    except Exception:
+        return
+    moved = math.hypot(pose_x - float(progress_gov_anchor_x), pose_y - float(progress_gov_anchor_y)) > float(PROGRESS_GOV_POSE_EPS_M)
+    gained = (cov - float(progress_gov_anchor_cov)) >= float(PROGRESS_GOV_COV_GAIN_PERCENT)
+    if moved or gained or progress_gov_since < -100.0:
+        # Genuine progress (the robot moved or coverage grew) -> reset the anchor.
+        progress_gov_anchor_x = float(pose_x)
+        progress_gov_anchor_y = float(pose_y)
+        progress_gov_anchor_cov = cov
+        progress_gov_since = now
+        progress_gov_escalations = 0
+        progress_gov_relocations = 0
+        last_progress_gov_debug = f"prog=ok moved={int(moved)}"
+        return
+    stall = max(0.0, now - float(progress_gov_since))
+    if stall < float(PROGRESS_GOV_STALL_SEC):
+        last_progress_gov_debug = f"prog=watch {stall:.0f}/{PROGRESS_GOV_STALL_SEC:.0f}s"
+        return
+    # Frozen pose with no coverage gain for the whole window: abandon the goal.
+    progress_gov_escalations += 1
+    if coverage_goal_map is not None:
+        try:
+            register_map_target_blacklist(
+                int(coverage_goal_map[0]), int(coverage_goal_map[1]),
+                str(coverage_goal_kind or "frontier"),
+                "progress-governor: frozen no-gain",
+                ttl_sec=float(PROGRESS_GOV_BLACKLIST_SEC),
+                radius_m=float(PROGRESS_GOV_BLACKLIST_RADIUS_M),
+            )
+        except Exception:
+            pass
+    last_planner_update_step = -999999
+    progress_gov_since = now  # restart the window after acting
+    last_progress_gov_debug = f"prog=ABANDON esc={progress_gov_escalations} stall={stall:.0f}s"
+    if progress_gov_escalations >= int(PROGRESS_GOV_MAX_ESCALATIONS_BEFORE_DOCK):
+        gray = int(last_gray_gap_cells or 0)
+        map_still_open = gray > int(PROGRESS_GOV_DOCK_MAX_GRAY_GAP_CELLS)
+        if map_still_open and progress_gov_relocations < int(PROGRESS_GOV_MAX_RELOCATIONS_BEFORE_DOCK):
+            # The map is NOT a closed room yet (large gray gap remains).  Repeated
+            # freezes here mean "stuck in this spot", not "map done" -> do NOT dock.
+            # Relocate: blacklist a wide area around the stuck goal so the planner is
+            # forced to a far region, and keep exploring.
+            progress_gov_relocations += 1
+            if coverage_goal_map is not None:
+                try:
+                    register_map_target_blacklist(
+                        int(coverage_goal_map[0]), int(coverage_goal_map[1]),
+                        str(coverage_goal_kind or "frontier"),
+                        "progress-governor: relocate (gray remains)",
+                        ttl_sec=float(PROGRESS_GOV_RELOCATE_BLACKLIST_SEC),
+                        radius_m=float(PROGRESS_GOV_RELOCATE_BLACKLIST_RADIUS_M),
+                    )
+                except Exception:
+                    pass
+            progress_gov_escalations = 0
+            last_planner_update_step = -999999
+            last_progress_gov_debug = f"prog=relocate {progress_gov_relocations} gray={gray}"
+        else:
+            # Map effectively closed (gray small) OR relocations exhausted (the
+            # remaining gray is genuinely unreachable) -> go home.
+            try:
+                start_map_complete_return_to_dock("progress-governor: map closed/exhausted")
+            except Exception:
+                try:
+                    start_return_to_dock("progress-governor: map closed/exhausted")
+                except Exception:
+                    pass
+            progress_gov_escalations = 0
+            progress_gov_relocations = 0
+            last_progress_gov_debug = f"prog=DOCK gray={gray} reloc={progress_gov_relocations}"
+
+
+>>>>>>> brave-merkle-main
 def wall_trapped_frontier_watchdog():
     """Hybrid fix for the robot oscillating along a wall after an unreachable frontier.
 
@@ -17051,7 +17687,11 @@ def wall_trapped_frontier_watchdog():
 
     Returns True if it took over motion (a scan started), else False.
     """
+<<<<<<< HEAD
     global wall_trap_anchor, wall_trap_anchor_cov, wall_trap_zone_actions
+=======
+    global wall_trap_anchor, wall_trap_anchor_cov, wall_trap_anchor_gray, wall_trap_zone_actions
+>>>>>>> brave-merkle-main
     global wall_trap_since, wall_trap_last_action_time, wall_trap_scanned
     global last_wall_trap_debug, last_planner_update_step
     if not WALL_TRAP_FRONTIER_WATCHDOG_ENABLED:
@@ -17073,6 +17713,10 @@ def wall_trapped_frontier_watchdog():
     gx, gy = int(coverage_goal_map[0]), int(coverage_goal_map[1])
     rmx, rmy = world_to_map(pose_x, pose_y)
     cov_now = float(last_coverage_percent or 0.0)
+<<<<<<< HEAD
+=======
+    gray_now = int(last_gray_gap_cells or 0)
+>>>>>>> brave-merkle-main
     # Trap signature: the ROBOT is pinned in one wall column.  It can still drive
     # up/down the strip (y varies a lot) and the frontier candidate can jump
     # along the wall, but the robot column (x) does not move and coverage does
@@ -17087,6 +17731,10 @@ def wall_trapped_frontier_watchdog():
         if near:
             wall_trap_anchor = (rmx, rmy)
             wall_trap_anchor_cov = cov_now
+<<<<<<< HEAD
+=======
+            wall_trap_anchor_gray = gray_now
+>>>>>>> brave-merkle-main
             wall_trap_since = now
             wall_trap_zone_actions = 0
         last_wall_trap_debug = f"wallTrap=track near={int(near)} d={col_dist_m:.2f}"
@@ -17095,17 +17743,39 @@ def wall_trapped_frontier_watchdog():
     # Reset only on real progress: the robot left the stuck column, or coverage
     # advanced.  Movement up/down the same strip (y) and candidate jumps do not.
     robot_left_zone = abs(float(rmx - int(wall_trap_anchor[0]))) > zone_eps_px
+<<<<<<< HEAD
     cov_progress = (cov_now - float(wall_trap_anchor_cov)) >= cov_gain
     if robot_left_zone or cov_progress:
         if near:
             wall_trap_anchor = (rmx, rmy)
             wall_trap_anchor_cov = cov_now
+=======
+    # Real progress that should reset the trap.  After the room has closed, driving up/down
+    # an occluded wall strip raises coverage (cleaning floor) without mapping anything, so
+    # coverage is NOT progress here — require the interior gray to actually shrink.  Before
+    # closure, coverage growth is still ~ genuine discovery, so keep the cov-gain reset.
+    if frontier_room_closed:
+        map_progress = (int(wall_trap_anchor_gray) - gray_now) >= int(WALL_TRAP_FRONTIER_ZONE_GRAY_DROP_CELLS)
+        progress_dbg = f"dgray={int(wall_trap_anchor_gray) - gray_now}"
+    else:
+        map_progress = (cov_now - float(wall_trap_anchor_cov)) >= cov_gain
+        progress_dbg = f"dcov={cov_now - float(wall_trap_anchor_cov):.1f}"
+    if robot_left_zone or map_progress:
+        if near:
+            wall_trap_anchor = (rmx, rmy)
+            wall_trap_anchor_cov = cov_now
+            wall_trap_anchor_gray = gray_now
+>>>>>>> brave-merkle-main
             wall_trap_since = now
             wall_trap_zone_actions = 0
         else:
             wall_trap_anchor = None
             wall_trap_zone_actions = 0
+<<<<<<< HEAD
         last_wall_trap_debug = f"wallTrap=track moved={int(robot_left_zone)} dcov={cov_now - float(wall_trap_anchor_cov):.1f}"
+=======
+        last_wall_trap_debug = f"wallTrap=track moved={int(robot_left_zone)} {progress_dbg}"
+>>>>>>> brave-merkle-main
         return False
 
     stall = max(0.0, now - float(wall_trap_since))
@@ -17214,6 +17884,13 @@ def choose_motion_from_depth(depth):
     if mature_dock_return_stall_watchdog(left, right, body_clearance):
         return (0.0, 0.0)
 
+<<<<<<< HEAD
+=======
+    # Global progress governor (anti-freeze): if pose + coverage are frozen while a
+    # goal is held, abandon the goal regardless of which stuck mode caused it.
+    global_progress_governor()
+
+>>>>>>> brave-merkle-main
     # Wall-trapped frontier watchdog: scan the wall once, then blacklist an
     # unreachable strip frontier so exploration stops oscillating along a wall.
     if wall_trapped_frontier_watchdog():
@@ -18786,7 +19463,7 @@ def draw_map_hud_and_legend(img):
         (FREE_COLOR, "white = free/passable space"),
         (OCC_COLOR, "black = confirmed occupied obstacle"),
         (CONTACT_COLOR, "yellow = bumper-confirmed contact obstacle"),
-        (HYPOTHESIS_OBSTACLE_COLOR, "orange = inferred obstacle / occlusion no-go"),
+        (HYPOTHESIS_OBSTACLE_COLOR, "orange = filled obstacle body"),
         (UNDER_SURFACE_COLOR, "pale yellow = passable under-furniture floor"),
         (CV_SEEN_COLOR, "light pink = RGB-D visual evidence"),
         (CV_DENSE_COLOR, "dark purple = dense CV boundary"),
@@ -18832,12 +19509,344 @@ def draw_furniture_zone_overlay(img, alpha_inflated=0.36, draw_labels=True):
     return img
 
 
+obstacle_body_fill_cache = None
+obstacle_body_fill_cache_step = -999999
+
+
+def _fill_enclosed_holes(comp_bool):
+    """Solid-fill the interior enclosed by one connected obstacle component.
+
+    A ring/4-sided cluster of points becomes a solid body; an open segment (no
+    enclosed interior) is returned unchanged.  Pure geometry, no thresholds.
+    """
+    h, w = comp_bool.shape
+    canvas = np.zeros((h + 2, w + 2), np.uint8)
+    canvas[1:h + 1, 1:w + 1] = comp_bool.astype(np.uint8)
+    flood = canvas.copy()
+    ff_mask = np.zeros((h + 4, w + 4), np.uint8)
+    # Flood the exterior background (reachable from the padded corner) with 1.
+    cv2.floodFill(flood, ff_mask, (0, 0), 1)
+    holes = (canvas == 0) & (flood == 0)  # background NOT reachable from outside => enclosed
+    filled = (canvas > 0) | holes
+    return filled[1:h + 1, 1:w + 1].astype(np.bool_)
+
+
+def _fill_obstacle_body(comp_bool, free_bool):
+    """Body = the obstacle silhouette plus the unknown cells it walls off together
+    with the observed-free floor around it.
+
+    _fill_enclosed_holes needs a fully-closed ring, so furniture seen from only one
+    or two sides (an open arc) never gets a body.  But the robot has also driven the
+    floor AROUND such furniture, and that confidently-free floor closes the silhouette's
+    open sides.  Treating free floor as an extra flood barrier (without ever painting
+    it) fills the unknown interior trapped between the seen faces and the surrounding
+    floor, while a lone unobserved face stays connected to the outside and is never
+    claimed as body.  Pure geometry from observed evidence; no thresholds.  This also
+    makes fill quality track inspection quality: a barely-circled obstacle fills little.
+    """
+    h, w = comp_bool.shape
+    barrier = (comp_bool | free_bool)
+    canvas = np.zeros((h + 2, w + 2), np.uint8)
+    canvas[1:h + 1, 1:w + 1] = barrier.astype(np.uint8)
+    flood = canvas.copy()
+    ff_mask = np.zeros((h + 4, w + 4), np.uint8)
+    cv2.floodFill(flood, ff_mask, (0, 0), 1)
+    # Enclosed = NOT barrier AND NOT reachable from the padded exterior corner.
+    holes = (canvas == 0) & (flood == 0)
+    enclosed = holes[1:h + 1, 1:w + 1].astype(np.bool_)
+    return (comp_bool | enclosed)
+
+
+def _fit_obstacle_primitive(comp_bool, free_bool):
+    """Fit a standard primitive (rectangle or circle) to a studded obstacle cluster
+    and return it filled — 'completing' the shape the sparse RGB-D points only sketch.
+
+    Furniture in the scene is rectangular or round; depth/CV give a studded outline with
+    gray (unknown) floor inside.  We bound the cluster with the TIGHTER of min-area-rect
+    and min-enclosing-circle and fill it solid, so the implied body is reconstructed even
+    from a sparse, partly-open outline.  Guard: if the fitted shape would cover mostly
+    confidently-FREE floor (a bad fit spanning open space, e.g. an L-arc), return None so
+    the caller falls back to the conservative flood fill.  Pure geometry; display only.
+    The caller's `body &= ~free` / `~cleaned` post-clip still trims any floor it overlaps.
+    """
+    try:
+        pts = cv2.findNonZero(comp_bool.astype(np.uint8))
+        if pts is None or len(pts) < 5:
+            return None
+        h, w = comp_bool.shape
+        rect = cv2.minAreaRect(pts)
+        rw, rh = float(rect[1][0]), float(rect[1][1])
+        rect_area = max(1.0, rw * rh)
+        (ccx, ccy), cr = cv2.minEnclosingCircle(pts)
+        circ_area = math.pi * float(cr) * float(cr)
+        shape = np.zeros((h, w), np.uint8)
+        if circ_area <= rect_area:
+            cv2.circle(shape, (int(round(ccx)), int(round(ccy))), max(1, int(round(cr))), 1, -1)
+        else:
+            box = cv2.boxPoints(rect).astype(np.int32)
+            cv2.fillConvexPoly(shape, box, 1)
+        shape_b = shape > 0
+        n_shape = int(np.count_nonzero(shape_b))
+        if n_shape <= 0:
+            return None
+        free_in = int(np.count_nonzero(shape_b & free_bool)) if free_bool is not None else 0
+        if free_in > float(OBSTACLE_BODY_FILL_FIT_MAX_FREE_RATIO) * float(n_shape):
+            return None  # fit spans mostly open floor -> let caller flood-fill instead
+        return shape_b
+    except Exception:
+        return None
+
+
+def _build_body_gray_bridge(confirmed, wall):
+    """Gray-bridged geometric completion of obstacle bodies (display only).
+
+    A sparse studded OUTLINE often fragments into arcs that never connect, leaving the
+    obstacle's gray (unknown) interior unfilled.  Here we let the interior gray itself
+    bridge the gaps: seed = obstacle points + unknown cells within a short radius of them,
+    so a big partly-seen object becomes ONE cluster.  We fit the tighter of a min-area-rect
+    / min-enclosing-circle to the cluster's real obstacle POINTS and fill it, keeping the
+    shape only when it is genuinely backed by points-or-gray (not a guess over open floor).
+    Realises "gray walled by points that resembles a rectangle/circle = obstacle body".
+    Pure geometry; never feeds the planner.
+    """
+    body = np.zeros_like(confirmed, dtype=np.bool_)
+    gray = np.abs(log_odds) <= LO_UNKNOWN_EPS
+    free_floor = log_odds < float(OBSTACLE_HYPOTHESIS_FREE_CLEAR_LO)
+    # Bridge the outline by closing the obstacle POINTS only (bounded). We deliberately do
+    # NOT pull in nearby gray here: that over-reached and stitched scattered noise points
+    # together through open UNEXPLORED gray into a giant phantom rectangle. Gray is used
+    # below only as the ENCLOSED interior of a real outline, never to connect clusters.
+    link_px = max(1, int(round(float(OBSTACLE_BODY_FILL_GRAY_BRIDGE_M) * MAP_SCALE)))
+    kc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * link_px + 1, 2 * link_px + 1))
+    linked = cv2.morphologyEx(confirmed.astype(np.uint8), cv2.MORPH_CLOSE, kc, iterations=1) > 0
+    max_span_px = max(6, int(round(float(OBSTACLE_BODY_FILL_MAX_SPAN_M) * MAP_SCALE)))
+    min_ev = float(OBSTACLE_BODY_FILL_GRAY_MIN_EVIDENCE)
+    max_free = float(OBSTACLE_BODY_FILL_FIT_MAX_FREE_RATIO)
+    min_pts = int(OBSTACLE_BODY_FILL_MIN_COMPONENT_CELLS)
+    n, labels, stats, _c = cv2.connectedComponentsWithStats(linked.astype(np.uint8), 8)
+    for cid in range(1, int(n)):
+        x = int(stats[cid, cv2.CC_STAT_LEFT]); y = int(stats[cid, cv2.CC_STAT_TOP])
+        w = int(stats[cid, cv2.CC_STAT_WIDTH]); h = int(stats[cid, cv2.CC_STAT_HEIGHT])
+        if x <= 1 or y <= 1 or x + w >= MAP_SIZE - 2 or y + h >= MAP_SIZE - 2:
+            continue  # touches map edge (likely the arena wall ring)
+        comp = labels[y:y + h, x:x + w] == cid
+        pts_local = confirmed[y:y + h, x:x + w] & comp
+        if int(np.count_nonzero(pts_local)) < min_pts:
+            continue
+        pp = cv2.findNonZero(pts_local.astype(np.uint8))
+        if pp is None or len(pp) < 5:
+            continue
+        rect = cv2.minAreaRect(pp)
+        rw, rh = float(rect[1][0]), float(rect[1][1])
+        if max(rw, rh) > max_span_px:
+            continue  # wall / room-sized -> not an object body
+        (ccx, ccy), cr = cv2.minEnclosingCircle(pp)
+        shape = np.zeros((h, w), np.uint8)
+        if math.pi * float(cr) * float(cr) <= max(1.0, rw * rh):
+            cv2.circle(shape, (int(round(ccx)), int(round(ccy))), max(1, int(round(cr))), 1, -1)
+        else:
+            cv2.fillConvexPoly(shape, cv2.boxPoints(rect).astype(np.int32), 1)
+        shape_b = shape > 0
+        nsh = int(np.count_nonzero(shape_b))
+        if nsh <= 0:
+            continue
+        gray_local = gray[y:y + h, x:x + w]
+        free_local = free_floor[y:y + h, x:x + w]
+        wall_local = wall[y:y + h, x:x + w]
+        # Real body = the closed outline + the gray interior it ENCLOSES (walled off from the
+        # window border). Open/unexplored gray is reachable from outside -> excluded, so
+        # scattered points over open space cannot claim a solid rectangle.
+        holes = _fill_enclosed_holes(comp) & (~comp)
+        backed = comp | (holes & gray_local)
+        fill = shape_b & backed
+        # Keep only if the fitted figure is genuinely SOLID: the enclosed body must fill most
+        # of the rectangle/circle. A phantom rect over scattered points has little enclosed
+        # body -> rejected (this is the "looks like a figure" test).
+        if int(np.count_nonzero(fill)) < min_ev * nsh:
+            continue
+        if int(np.count_nonzero(shape_b & free_local)) > max_free * nsh:
+            continue  # spans mostly observed-free floor
+        if int(np.count_nonzero(shape_b & wall_local)) > 0.5 * nsh:
+            continue  # this cluster is mostly the arena wall
+        body[y:y + h, x:x + w] |= fill
+    # Honesty: never paint confidently-free or already-cleaned floor.
+    body &= ~free_floor
+    body &= ~(cleaned_mask > 0)
+    return body
+
+
+def _build_body_floor_enclosed(confirmed, wall):
+    """Obstacle body = the gap in the driveable BLUE floor that the robot circled.
+
+    The robot drives free/cleaned floor (blue) all around furniture, so each obstacle is a
+    non-blue region ENCLOSED by blue floor.  We flood the non-blue cells from the map border;
+    what the flood cannot reach is walled off by blue floor — an obstacle footprint (or an
+    unexplored pocket the path looped around).  Using the dense, reliable blue boundary instead
+    of fitting sparse outline points fills the whole body cleanly, big or small.  To avoid
+    painting an enclosed *unexplored* area, we keep a region only when its inner-edge ring is
+    lined with obstacle points (the robot actually sensed an obstacle at the floor boundary).
+    Display only; never feeds the planner.
+    """
+    body = np.zeros_like(confirmed, dtype=np.bool_)
+    blue = (log_odds < float(OBSTACLE_HYPOTHESIS_FREE_CLEAR_LO)) | (cleaned_mask > 0)
+    if not bool(np.any(blue)):
+        return body
+    h, w = blue.shape
+    floodable = (~blue).astype(np.uint8)
+    pad = cv2.copyMakeBorder(floodable, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=1)
+    ff = np.zeros((pad.shape[0] + 2, pad.shape[1] + 2), np.uint8)
+    cv2.floodFill(pad, ff, (0, 0), 2)
+    reached = pad[1:h + 1, 1:w + 1] == 2
+    enclosed = (~blue) & (~reached)   # non-blue, walled off from the border by blue floor
+    max_span_px = max(6, int(round(float(OBSTACLE_BODY_FILL_MAX_SPAN_M) * MAP_SCALE)))
+    min_pts = int(OBSTACLE_BODY_FILL_MIN_COMPONENT_CELLS)
+    floor_min_pts = int(OBSTACLE_BODY_FILL_FLOOR_MIN_PTS)
+    cover_px = max(1, int(round(float(OBSTACLE_BODY_FILL_FLOOR_COVER_M) * MAP_SCALE)))
+    kc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * cover_px + 1, 2 * cover_px + 1))
+    n, labels, stats, _c = cv2.connectedComponentsWithStats(enclosed.astype(np.uint8), 8)
+    for cid in range(1, int(n)):
+        x = int(stats[cid, cv2.CC_STAT_LEFT]); y = int(stats[cid, cv2.CC_STAT_TOP])
+        cw = int(stats[cid, cv2.CC_STAT_WIDTH]); ch = int(stats[cid, cv2.CC_STAT_HEIGHT])
+        if x <= 1 or y <= 1 or x + cw >= MAP_SIZE - 2 or y + ch >= MAP_SIZE - 2:
+            continue  # touches map edge (arena wall ring)
+        comp = labels[y:y + ch, x:x + cw] == cid
+        pts_local = confirmed[y:y + ch, x:x + cw] & comp
+        if int(np.count_nonzero(pts_local)) < min_pts:
+            continue  # no obstacle evidence -> unexplored floor pocket
+        # Keep the LARGEST obstacle-point cluster so a stray far point cannot inflate the
+        # fitted figure (the "black point far away stretched the rectangle" case).
+        pd = cv2.dilate(pts_local.astype(np.uint8), kc, iterations=1)
+        npl, plabels, pstats, _pc = cv2.connectedComponentsWithStats(pd, 8)
+        if npl <= 1:
+            continue
+        largest = 1 + int(np.argmax(pstats[1:, cv2.CC_STAT_AREA]))
+        main_pts = pts_local & (plabels == largest)
+        if int(np.count_nonzero(main_pts)) < floor_min_pts:
+            continue  # main cluster too small -> junk from a few scattered points
+        pp = cv2.findNonZero(main_pts.astype(np.uint8))
+        if pp is None or len(pp) < 5:
+            continue
+        rect = cv2.minAreaRect(pp)
+        rw, rh = float(rect[1][0]), float(rect[1][1])
+        if max(rw, rh) > max_span_px:
+            continue  # wall / room-sized -> not an object body
+        (ccx, ccy), cr = cv2.minEnclosingCircle(pp)
+        shape = np.zeros((ch, cw), np.uint8)
+        if math.pi * float(cr) * float(cr) <= max(1.0, rw * rh):
+            cv2.circle(shape, (int(round(ccx)), int(round(ccy))), max(1, int(round(cr))), 1, -1)
+        else:
+            cv2.fillConvexPoly(shape, cv2.boxPoints(rect).astype(np.int32), 1)
+        # Clean figure CLIPPED to the non-blue enclosed footprint: never paints driveable floor,
+        # never extends past where the robot drove around the object.
+        fill = (shape > 0) & comp
+        nfill = int(np.count_nonzero(fill))
+        if nfill < min_pts:
+            continue
+        if int(np.count_nonzero(fill & wall[y:y + ch, x:x + cw])) > 0.5 * nfill:
+            continue  # mostly the arena wall
+        body[y:y + ch, x:x + cw] |= fill
+    return body
+
+
+def build_obstacle_body_fill(force=False):
+    """Deterministic, decay-free obstacle BODY for display (not planning).
+
+    Rebuilt every render from CONFIRMED obstacle cells: bridge sparse studded
+    points (morphological close) so a dotted silhouette connects into one island,
+    then solid-fill each bounded cluster's enclosed interior.  Because it is derived
+    from confirmed evidence every frame (no log-odds accumulation/decay), it does
+    not flicker and it does not miss large/sparse obstacles the way the speculative
+    hypothesis layer did.  Walls / room perimeter are excluded per-component (span
+    cap, arena-wall touch, map edge); confidently-free and cleaned cells are never
+    painted, so it cannot bleed onto real floor or flood the room interior.
+    """
+    global obstacle_body_fill_cache, obstacle_body_fill_cache_step
+    if not OBSTACLE_BODY_FILL_ENABLED:
+        return None
+    if (not force) and obstacle_body_fill_cache is not None and int(step_id) == int(obstacle_body_fill_cache_step):
+        return obstacle_body_fill_cache
+    try:
+        confirmed = base_physical_obstacle_mask().astype(np.bool_)
+        if STRUCTURAL_OBSTACLE_MEMORY_ENABLED:
+            confirmed = confirmed | (structural_log_odds > STRUCTURAL_OCCUPIED_EPS)
+        confirmed = confirmed | (visual_log_odds > CV_DISPLAY_DENSE_EPS)
+        body = np.zeros_like(confirmed, dtype=np.bool_)
+        if bool(np.any(confirmed)) and bool(OBSTACLE_BODY_FILL_FLOOR_ENCLOSED):
+            # Round 6v: obstacle = the non-blue gap the driveable floor encloses (robust).
+            body = _build_body_floor_enclosed(confirmed, arena_wall_touch_mask())
+        elif bool(np.any(confirmed)) and bool(OBSTACLE_BODY_FILL_GRAY_BRIDGE):
+            # Round 6u: gray-bridged geometric completion (connects big sparse outlines
+            # through their enclosed gray interior, then fits/fills a primitive).
+            body = _build_body_gray_bridge(confirmed, arena_wall_touch_mask())
+        elif bool(np.any(confirmed)):
+            close_px = max(1, int(round(float(OBSTACLE_BODY_FILL_CLOSE_M) * MAP_SCALE)))
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * close_px + 1, 2 * close_px + 1))
+            closed = cv2.morphologyEx(confirmed.astype(np.uint8), cv2.MORPH_CLOSE, k, iterations=1) > 0
+            wall = arena_wall_touch_mask()
+            # Confidently-free floor acts as an extra flood barrier so an obstacle the
+            # robot has driven AROUND (but only partially seen) still gets its interior
+            # body filled, while a lone unobserved face never bleeds into the open room.
+            floor_barrier = bool(OBSTACLE_BODY_FILL_FLOOR_BARRIER)
+            fit_primitives = bool(OBSTACLE_BODY_FILL_FIT_PRIMITIVES)
+            need_free = bool(floor_barrier or fit_primitives)
+            free_floor = (log_odds < float(OBSTACLE_HYPOTHESIS_FREE_CLEAR_LO)) if need_free else None
+            pad_px = max(close_px, int(round(float(OBSTACLE_BODY_FILL_BARRIER_PAD_M) * MAP_SCALE))) if need_free else 0
+            max_span_px = max(6, int(round(float(OBSTACLE_BODY_FILL_MAX_SPAN_M) * MAP_SCALE)))
+            n, labels, stats, _c = cv2.connectedComponentsWithStats(closed.astype(np.uint8), 8)
+            for cid in range(1, int(n)):
+                area = int(stats[cid, cv2.CC_STAT_AREA])
+                if area < int(OBSTACLE_BODY_FILL_MIN_COMPONENT_CELLS):
+                    continue
+                x = int(stats[cid, cv2.CC_STAT_LEFT])
+                y = int(stats[cid, cv2.CC_STAT_TOP])
+                w = int(stats[cid, cv2.CC_STAT_WIDTH])
+                h = int(stats[cid, cv2.CC_STAT_HEIGHT])
+                if max(w, h) > max_span_px:
+                    continue  # wall / room-sized span -> not an object body
+                if x <= 1 or y <= 1 or x + w >= MAP_SIZE - 2 or y + h >= MAP_SIZE - 2:
+                    continue  # touches map edge
+                # Pad the working window so surrounding observed-free floor is available
+                # to close the silhouette's open sides (component is map-edge-safe above).
+                yy0 = max(0, y - pad_px); yy1 = min(MAP_SIZE, y + h + pad_px)
+                xx0 = max(0, x - pad_px); xx1 = min(MAP_SIZE, x + w + pad_px)
+                comp = (labels[yy0:yy1, xx0:xx1] == cid)
+                if bool(np.any(comp & wall[yy0:yy1, xx0:xx1])):
+                    continue  # part of the arena wall ring
+                free_local = (free_floor[yy0:yy1, xx0:xx1] & (~comp)) if free_floor is not None else None
+                if fit_primitives:
+                    shape = _fit_obstacle_primitive(comp, free_local)
+                    if shape is not None:
+                        body[yy0:yy1, xx0:xx1] |= shape
+                        continue  # completed primitive -> done with this cluster
+                if floor_barrier:
+                    body[yy0:yy1, xx0:xx1] |= _fill_obstacle_body(comp, free_local)
+                else:
+                    body[yy0:yy1, xx0:xx1] |= _fill_enclosed_holes(comp)
+            # Honesty: never paint confidently-free or already-cleaned floor.
+            body &= ~(log_odds < float(OBSTACLE_HYPOTHESIS_FREE_CLEAR_LO))
+            body &= ~(cleaned_mask > 0)
+        obstacle_body_fill_cache = body.astype(np.bool_)
+        obstacle_body_fill_cache_step = int(step_id)
+        return obstacle_body_fill_cache
+    except Exception:
+        return obstacle_body_fill_cache
+
+
 def draw_hypothesis_obstacle_overlay(img, alpha=0.62, draw_labels=False):
-    """Draw orange inferred-obstacle/occlusion-shadow cells."""
+    """Draw orange inferred-obstacle/occlusion-shadow cells.
+
+    In mapping mode the obstacle BODY comes from the deterministic geometric fill
+    (build_obstacle_body_fill) so it does not flicker; the speculative hypothesis
+    log-odds layer is used only as the fallback when that is disabled.
+    """
     if not OBSTACLE_HYPOTHESIS_ENABLED:
         return img
     try:
-        hyp = hypothesis_obstacle_mask(force=False)
+        hyp = None
+        if OBSTACLE_BODY_FILL_ENABLED:
+            hyp = build_obstacle_body_fill(force=False)
+        if hyp is None:
+            hyp = hypothesis_obstacle_mask(force=False)
         if hyp is None or not np.any(hyp):
             return img
         overlay = img.copy()
@@ -19112,8 +20121,11 @@ def render_coverage_planner_map(auto_crop=True):
     cv2.rectangle(canvas, (0, 0), (MAP_VIEW_W - 1, hud_h - 1), (95, 95, 95), 1)
 
     mode_text = f"{planner_mode} | {known_map_eval_status[:24]} | {map_view_status_text()}"
+    # Lead with an HONEST exploration progress label (two-mode: open -> mapped area +
+    # frontier; closed -> bounded-room resolved %), never driven-floor coverage which
+    # says nothing about how explored the map is.  See exploration_progress_hud_text().
     cv2.putText(canvas,
-                f"Coverage: {last_coverage_percent:.1f}% ({last_coverage_cleaned_cells}/{last_coverage_total_cells}) | conf={planner_confidence} intent={planner_intent} | {mode_text}",
+                f"{exploration_progress_hud_text()} | driven {last_coverage_percent:.1f}% | conf={planner_confidence} intent={planner_intent} | {mode_text}",
                 (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (0, 0, 0), 1, cv2.LINE_AA)
     cv2.putText(canvas,
                 f"phase={navigation_phase} | nav={nav_state} | owner={last_control_owner_debug[:18]} | {owner_source_debug()[:22]} | {last_mapping_write_debug[:30]} | {load_shedding_debug_text()[:18]}",
@@ -19163,14 +20175,47 @@ def save_run_summary(reason=""):
             "dock_return_completed": bool(dock_return_completed),
             "map_mature": bool(map_mature),
         }
+<<<<<<< HEAD
+=======
+        # Round 6t: exploration-completeness + reconstruction headline metrics.
+        _exp_pct, _exp_known, _exp_unk = exploration_explored_pct()
+        metrics.update({
+            "explored_percent": round(float(_exp_pct), 2),
+            "known_cells": int(_exp_known),
+            "interior_unknown_cells": int(_exp_unk),
+            "room_closed": bool(frontier_room_closed),
+            "obstacle_body_fill_cells": int(np.count_nonzero(obstacle_body_fill_cache)) if obstacle_body_fill_cache is not None else 0,
+        })
+        # Pull ground-truth map-quality (precision/recall/F1/IoU) + localisation from the recorder.
+        try:
+            rec = metrics_recorder.summary() if METRICS_ENABLED else {}
+        except Exception:
+            rec = {}
+        for k in ("obstacle_precision_final", "obstacle_recall_final", "obstacle_f1", "obstacle_iou",
+                  "recon_precision_final", "recon_recall_final", "recon_f1", "recon_iou",
+                  "localization_error_rmse_m", "exploration_efficiency_m2_per_m", "time_to_room_closed_s"):
+            metrics[k] = rec.get(k)
+>>>>>>> brave-merkle-main
         metrics_path = maps_dir / f"run_metrics_{ts:07d}.json"
         with open(str(metrics_path), "w") as f:
             json.dump(metrics, f, indent=2)
         print(f"[save_run_summary] {reason} → {metrics_path}")
+<<<<<<< HEAD
         print(f"  cov={metrics['coverage_percent']:.1f}% "
               f"fr={metrics['frontier_cells']} "
               f"grayGap={metrics['gray_gap_cells']}/{metrics['gray_gap_components']} "
               f"obsBoundary={metrics['obs_boundary_cells']}")
+=======
+        print(f"  explored={metrics['explored_percent']:.1f}% (unk {metrics['interior_unknown_cells']}) "
+              f"roomClosed={metrics['room_closed']} bodyFill={metrics['obstacle_body_fill_cells']} "
+              f"driven cov={metrics['coverage_percent']:.1f}%")
+        print(f"  obstacleMap (raw):   precision={metrics.get('obstacle_precision_final')} "
+              f"recall={metrics.get('obstacle_recall_final')} F1={metrics.get('obstacle_f1')} "
+              f"IoU={metrics.get('obstacle_iou')} | locRMSE={metrics.get('localization_error_rmse_m')}m")
+        print(f"  obstacleMap (recon): precision={metrics.get('recon_precision_final')} "
+              f"recall={metrics.get('recon_recall_final')} F1={metrics.get('recon_f1')} "
+              f"IoU={metrics.get('recon_iou')}  → obstacle_comparison_reconstructed.png")
+>>>>>>> brave-merkle-main
     except Exception as exc:
         print(f"[save_run_summary] error: {type(exc).__name__}: {exc}")
 
@@ -19222,7 +20267,7 @@ def reset_map():
     global active_scan_target_yaws, active_scan_index, active_scan_dwell_until, active_scan_started_at
     global active_scan_started_x, active_scan_started_y, active_scan_reason, active_scan_last_completed_at
     global active_scan_last_x, active_scan_last_y, active_scan_start_frontier_local, active_scan_start_unknown_local
-    global active_scan_area_memory, last_active_scan_debug, last_rgbd_occlusion_debug, last_exploration_cleanup_lock_debug, last_exploration_route_debug
+    global active_scan_area_memory, active_scan_abort_memory, last_active_scan_debug, last_rgbd_occlusion_debug, last_exploration_cleanup_lock_debug, last_exploration_route_debug
     global post_turn_rgbd_snapshot_until, post_turn_rgbd_snapshot_started_at, post_turn_rgbd_snapshot_frames, post_turn_rgbd_snapshot_write_frames, post_turn_rgbd_snapshot_pending, last_post_turn_snapshot_debug
     global simple_sweep_churn_anchor_x, simple_sweep_churn_anchor_y, simple_sweep_churn_start_time
     global simple_sweep_churn_action_count, simple_sweep_churn_last_debug
@@ -19375,6 +20420,7 @@ def reset_map():
     active_scan_start_frontier_local = 0
     active_scan_start_unknown_local = 0
     active_scan_area_memory = []
+    active_scan_abort_memory = []
     last_active_scan_debug = "scan=reset"
     post_turn_rgbd_snapshot_until = -999.0
     post_turn_rgbd_snapshot_started_at = -999.0
@@ -19597,6 +20643,23 @@ def collect_metrics_snapshot(heavy=False):
         "low_obstacle_debug": str(last_low_obstacle_memory_debug),
     }
     snap.update(localization_error_fields())
+<<<<<<< HEAD
+=======
+    # Round 6t: exploration-completeness + reconstruction metrics (cheap, every sample).
+    # explored% is the unknown-collapse measure (known/(known+interiorUnknown)); body-fill
+    # cells measure how much obstacle body the geometric reconstruction recovered.
+    _exp_pct, _exp_known, _exp_unk = exploration_explored_pct()
+    _cell_area = float(max(1.0, float(MAP_SCALE) * float(MAP_SCALE)))
+    snap.update({
+        "explored_percent": float(_exp_pct),
+        "known_cells": int(_exp_known),
+        "interior_unknown_cells": int(_exp_unk),
+        "room_closed": bool(frontier_room_closed),
+        "obstacle_body_fill_cells": int(np.count_nonzero(obstacle_body_fill_cache)) if obstacle_body_fill_cache is not None else 0,
+        "explored_area_m2": float(_exp_known) / _cell_area,
+        "coverage_area_m2": float(last_coverage_cleaned_cells or 0) / _cell_area,
+    })
+>>>>>>> brave-merkle-main
     if heavy:
         try:
             actual, center_no_go, cleanable_floor = build_planning_layers(force=False)
@@ -19651,6 +20714,34 @@ def collect_metrics_snapshot(heavy=False):
                         tolerance_px=gt_tol_px)
                 except Exception:
                     pass
+<<<<<<< HEAD
+=======
+                # Round 6u: reconstruction-based evaluation. Compare the geometric body-fill
+                # COMPLETION against ground truth so the filled obstacle bodies count as matched,
+                # not just the sparse sensed outline. The filled interior is added to the explored
+                # set so the solid ground-truth boxes are evaluated (not skipped as unknown).
+                # Saved + reported SEPARATELY from the raw-mask metric (which stays the thesis one).
+                if OBSTACLE_BODY_FILL_ENABLED:
+                    try:
+                        body_fill = build_obstacle_body_fill(force=False)
+                        body_fill = body_fill.astype(np.bool_) if body_fill is not None else np.zeros_like(actual, dtype=np.bool_)
+                        recon = actual.astype(np.bool_) | body_fill
+                        explored_recon = explored | recon
+                        recon_stats = ground_truth_map.false_cell_metrics(recon, gt_grid, explored_recon, tolerance_px=gt_tol_px)
+                        snap.update({
+                            "recon_obstacle_cells": recon_stats["robot_obstacle_cells"],
+                            "recon_false_occupied_cells": recon_stats["false_occupied_cells"],
+                            "recon_false_free_cells": recon_stats["false_free_cells"],
+                            "recon_precision": recon_stats["obstacle_precision"],
+                            "recon_recall": recon_stats["obstacle_recall"],
+                        })
+                        ground_truth_map.save_comparison_png(
+                            recon, gt_grid,
+                            metrics_dir / "obstacle_comparison_reconstructed.png", explored_recon,
+                            tolerance_px=gt_tol_px)
+                    except Exception:
+                        pass
+>>>>>>> brave-merkle-main
             metrics_last_debug = f"metrics=sample heavy weak={int(np.count_nonzero(weak_unconfirmed))}"
         except Exception as exc:
             snap.update({"quality_ok": False, "quality_debug": f"metrics heavy err {type(exc).__name__}"})
