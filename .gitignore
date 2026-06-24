@@ -1,0 +1,17 @@
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Run artifacts (regenerated each run)
+controllers/*/maps/
+controllers/*/metrics/
+controllers/*/**/maps/
+controllers/*/**/metrics/
+*.png
+*.csv
+*.json.tmp
+
+# Webots build/project temp
+worlds/.*.wbproj
+*.cache

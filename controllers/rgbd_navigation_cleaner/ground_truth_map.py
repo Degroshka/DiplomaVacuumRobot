@@ -214,12 +214,31 @@ def save_ground_truth_png(gt_grid, path, pad: int = 24) -> bool:
     return True
 
 
-def save_comparison_png(robot_obstacles, gt_grid, path, evaluation_mask=None, pad: int = 24) -> bool:
+def _dilate_mask(mask, tolerance_px: int):
+    """Grow a boolean mask by ``tolerance_px`` cells (a match-tolerance band).
+
+    The learned obstacle map is rarely aligned to the ground-truth geometry to
+    the exact cell: depth/odometry noise and the finite map resolution put the
+    robot's obstacle one or a few cells off the true edge.  Counting that as a
+    full error is too strict, so a cell counts as a match when a real obstacle
+    sits within this tolerance.  Returns the mask unchanged if tolerance<=0 or
+    cv2 is unavailable.
+    """
+    if tolerance_px <= 0 or cv2 is None:
+        return mask
+    r = int(tolerance_px)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    return cv2.dilate(mask.astype(np.uint8), k, iterations=1) > 0
+
+
+def save_comparison_png(robot_obstacles, gt_grid, path, evaluation_mask=None, pad: int = 24,
+                        tolerance_px: int = 0) -> bool:
     """Save an overlay of the learned obstacle map vs ground truth.
 
-    Colours (BGR): grey = correct obstacle (true positive), red = false-occupied
-    (robot says obstacle, truly free), blue = false-free (robot missed a real
-    obstacle).  Restricted to ``evaluation_mask`` (explored cells) when given.
+    Colours (BGR): grey = correct obstacle (matched within ``tolerance_px``),
+    red = false-occupied (robot says obstacle, none within tolerance), blue =
+    false-free (real obstacle the robot missed within tolerance).  Restricted to
+    ``evaluation_mask`` (explored cells) when given.
     """
     if cv2 is None:
         return False
@@ -234,22 +253,33 @@ def save_comparison_png(robot_obstacles, gt_grid, path, evaluation_mask=None, pa
     y0, y1, x0, x1 = bounds
     r = robot[y0:y1, x0:x1]
     g = gt[y0:y1, x0:x1]
+    # Tolerance bands: a robot cell is correct if a real obstacle is within
+    # tolerance, and a real obstacle is covered if the robot built one nearby.
+    g_dil = _dilate_mask(g, tolerance_px)
+    r_dil = _dilate_mask(r, tolerance_px)
+    matched = (r & g_dil) | (g & r_dil)   # grey: agreement within tolerance
     img = np.full((r.shape[0], r.shape[1], 3), 245, dtype=np.uint8)
-    img[r & g] = (110, 110, 110)      # true positive  - grey
-    img[(~r) & g] = (200, 90, 0)      # false free      - blue (missed)
-    img[r & (~g)] = (0, 0, 220)       # false occupied  - red
-    cv2.putText(img, "grey=ok  red=false-occupied  blue=missed", (8, 22),
+    img[matched] = (110, 110, 110)        # true positive  - grey
+    img[g & (~r_dil)] = (200, 90, 0)      # false free      - blue (missed)
+    img[r & (~g_dil)] = (0, 0, 220)       # false occupied  - red
+    label = "grey=ok  red=false-occupied  blue=missed"
+    if tolerance_px > 0:
+        label += f"  (tol={int(tolerance_px)}px)"
+    cv2.putText(img, label, (8, 22),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (20, 20, 20), 1, cv2.LINE_AA)
     cv2.imwrite(str(path), img)
     return True
 
 
-def false_cell_metrics(robot_obstacles, gt_obstacles, evaluation_mask=None) -> Dict:
+def false_cell_metrics(robot_obstacles, gt_obstacles, evaluation_mask=None,
+                       tolerance_px: int = 0) -> Dict:
     """Compare the learned obstacle mask against the ground-truth reference.
 
     ``evaluation_mask`` restricts the comparison to explored/known cells so the
-    still-unknown part of the map is not unfairly counted as error.  Returns
-    false-positive (occupied but truly free) and false-negative ratios.
+    still-unknown part of the map is not unfairly counted as error.
+    ``tolerance_px`` allows a match band so a robot obstacle that is a few cells
+    off the true edge still counts as correct.  Returns false-positive (occupied
+    but truly free) and false-negative ratios.
     """
     robot = np.asarray(robot_obstacles, dtype=bool)
     gt = np.asarray(gt_obstacles, dtype=bool)
@@ -259,9 +289,15 @@ def false_cell_metrics(robot_obstacles, gt_obstacles, evaluation_mask=None) -> D
         gt = gt & m
     robot_occ = int(np.count_nonzero(robot))
     gt_occ = int(np.count_nonzero(gt))
-    false_pos = int(np.count_nonzero(robot & (~gt)))   # robot says obstacle, truly free
-    false_neg = int(np.count_nonzero((~robot) & gt))   # robot missed a real obstacle
-    true_pos = int(np.count_nonzero(robot & gt))
+    gt_dil = _dilate_mask(gt, tolerance_px)
+    robot_dil = _dilate_mask(robot, tolerance_px)
+    # A robot cell is a true positive if a real obstacle is within tolerance.
+    robot_match = robot & gt_dil
+    false_pos = int(np.count_nonzero(robot & (~gt_dil)))   # obstacle, none truly near
+    # A real obstacle is covered if the robot built something within tolerance.
+    gt_covered = int(np.count_nonzero(gt & robot_dil))
+    false_neg = int(np.count_nonzero(gt & (~robot_dil)))   # real obstacle missed
+    true_pos = int(np.count_nonzero(robot_match))
     return {
         "gt_obstacle_cells": gt_occ,
         "robot_obstacle_cells": robot_occ,
@@ -270,5 +306,5 @@ def false_cell_metrics(robot_obstacles, gt_obstacles, evaluation_mask=None) -> D
         "true_occupied_cells": true_pos,
         "false_occupied_ratio": (false_pos / robot_occ) if robot_occ else 0.0,
         "obstacle_precision": (true_pos / robot_occ) if robot_occ else 0.0,
-        "obstacle_recall": (true_pos / gt_occ) if gt_occ else 0.0,
+        "obstacle_recall": (gt_covered / gt_occ) if gt_occ else 0.0,
     }

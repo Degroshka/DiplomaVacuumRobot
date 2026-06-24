@@ -69,6 +69,18 @@ class MetricsRecorder:
         "false_occupied_ratio",
         "obstacle_precision",
         "obstacle_recall",
+        "recon_precision",
+        "recon_recall",
+        "recon_obstacle_cells",
+        "recon_false_occupied_cells",
+        "recon_false_free_cells",
+        "explored_percent",
+        "known_cells",
+        "interior_unknown_cells",
+        "room_closed",
+        "obstacle_body_fill_cells",
+        "explored_area_m2",
+        "coverage_area_m2",
         "quality_ok",
         "quality_debug",
         "loop_ms",
@@ -131,6 +143,21 @@ class MetricsRecorder:
         self.false_occupied_cells_final = 0
         self.false_free_cells_final = 0
         self.gt_obstacle_cells = 0
+        # Exploration completeness + obstacle reconstruction (Round 6t).
+        self.explored_percent_final = 0.0
+        self.explored_percent_max = 0.0
+        self.explored_area_final = 0.0
+        self.room_closed = False
+        self.time_to_room_closed = None
+        self.body_fill_final = 0
+        self.body_fill_max = 0
+        # Reconstruction (geometric body-fill) vs ground truth (Round 6u).
+        self.recon_gt_samples = 0
+        self.recon_precision_final = None
+        self.recon_recall_final = None
+        self.recon_false_occupied_cells_final = 0
+        self.recon_false_free_cells_final = 0
+        self.recon_obstacle_cells_final = 0
         self.mode_seconds: Dict[str, float] = {}
         self.owner_seconds: Dict[str, float] = {}
         self._prev_time = None
@@ -239,6 +266,27 @@ class MetricsRecorder:
             self.false_free_cells_final = self._as_int(snapshot.get("false_free_cells"), 0)
             self.gt_obstacle_cells = self._as_int(snapshot.get("gt_obstacle_cells"), 0)
 
+        if "recon_precision" in snapshot:
+            self.recon_gt_samples += 1
+            self.recon_precision_final = self._as_float(snapshot.get("recon_precision"), 0.0)
+            self.recon_recall_final = self._as_float(snapshot.get("recon_recall"), 0.0)
+            self.recon_false_occupied_cells_final = self._as_int(snapshot.get("recon_false_occupied_cells"), 0)
+            self.recon_false_free_cells_final = self._as_int(snapshot.get("recon_false_free_cells"), 0)
+            self.recon_obstacle_cells_final = self._as_int(snapshot.get("recon_obstacle_cells"), 0)
+
+        # Exploration completeness + obstacle reconstruction (Round 6t).
+        explored_pct = self._as_float(snapshot.get("explored_percent"), self.explored_percent_final)
+        self.explored_percent_final = explored_pct
+        self.explored_percent_max = max(self.explored_percent_max, explored_pct)
+        self.explored_area_final = self._as_float(snapshot.get("explored_area_m2"), self.explored_area_final)
+        body_fill = self._as_int(snapshot.get("obstacle_body_fill_cells"), self.body_fill_final)
+        self.body_fill_final = body_fill
+        self.body_fill_max = max(self.body_fill_max, body_fill)
+        room_closed_now = snapshot.get("room_closed", False)
+        if (not self.room_closed) and (room_closed_now is True or str(room_closed_now).lower() == "true"):
+            self.room_closed = True
+            self.time_to_room_closed = max(0.0, time_s - (self.first_time if self.first_time is not None else time_s))
+
         bumper_active = bool(snapshot.get("bumper_active", False))
         if bumper_active and not self._prev_bumper_active:
             self.total_bumper_events += 1
@@ -293,6 +341,25 @@ class MetricsRecorder:
 
     def summary(self) -> Dict[str, Any]:
         duration = max(0.0, (self.last_time - self.first_time) if self.first_time is not None else 0.0)
+        # Derived map-quality metrics (Round 6t): F1 and IoU of the obstacle map vs ground
+        # truth, from the already-collected precision/recall and TP/FP/FN cell counts.
+        p = self.obstacle_precision_final
+        r = self.obstacle_recall_final
+        obstacle_f1 = round(2.0 * p * r / (p + r), 4) if (p is not None and r is not None and (p + r) > 0) else None
+        tp = max(0, int(self.gt_obstacle_cells) - int(self.false_free_cells_final))
+        iou_denom = tp + int(self.false_occupied_cells_final) + int(self.false_free_cells_final)
+        obstacle_iou = round(tp / iou_denom, 4) if (self.gt_samples and iou_denom > 0) else None
+        # Reconstruction (geometric body-fill completion) vs ground truth — the "after" metric.
+        rp = self.recon_precision_final
+        rr = self.recon_recall_final
+        recon_f1 = round(2.0 * rp * rr / (rp + rr), 4) if (rp is not None and rr is not None and (rp + rr) > 0) else None
+        recon_tp = max(0, int(self.gt_obstacle_cells) - int(self.recon_false_free_cells_final))
+        recon_iou_denom = recon_tp + int(self.recon_false_occupied_cells_final) + int(self.recon_false_free_cells_final)
+        recon_iou = round(recon_tp / recon_iou_denom, 4) if (self.recon_gt_samples and recon_iou_denom > 0) else None
+        exploration_efficiency = (
+            round(self.explored_area_final / self.path_length_m, 4)
+            if (self.path_length_m > 0 and self.explored_area_final > 0) else None
+        )
         return {
             "duration_s": round(duration, 3),
             "samples": int(self.sample_id),
@@ -319,6 +386,21 @@ class MetricsRecorder:
             "obstacle_precision_final": round(float(self.obstacle_precision_final), 4) if self.obstacle_precision_final is not None else None,
             "obstacle_recall_final": round(float(self.obstacle_recall_final), 4) if self.obstacle_recall_final is not None else None,
             "obstacle_recall_max": round(float(self.obstacle_recall_max), 4) if self.gt_samples else None,
+            "obstacle_f1": obstacle_f1,
+            "obstacle_iou": obstacle_iou,
+            "recon_precision_final": round(float(self.recon_precision_final), 4) if self.recon_precision_final is not None else None,
+            "recon_recall_final": round(float(self.recon_recall_final), 4) if self.recon_recall_final is not None else None,
+            "recon_f1": recon_f1,
+            "recon_iou": recon_iou,
+            "recon_obstacle_cells_final": int(self.recon_obstacle_cells_final) if self.recon_gt_samples else None,
+            "explored_percent_final": round(float(self.explored_percent_final), 3),
+            "explored_percent_max": round(float(self.explored_percent_max), 3),
+            "explored_area_m2_final": round(float(self.explored_area_final), 3),
+            "exploration_efficiency_m2_per_m": exploration_efficiency,
+            "room_closed": bool(self.room_closed),
+            "time_to_room_closed_s": round(float(self.time_to_room_closed), 2) if self.time_to_room_closed is not None else None,
+            "obstacle_body_fill_cells_final": int(self.body_fill_final),
+            "obstacle_body_fill_cells_max": int(self.body_fill_max),
             "bumper_events": int(self.total_bumper_events),
             "recovery_events": int(self.total_recovery_events),
             "route_abort_events": int(self.total_route_abort_events),
